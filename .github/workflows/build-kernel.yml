@@ -1,0 +1,69 @@
+name: Build kernel modules
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build dfm.ko for ${{ matrix.kmi }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        kmi:
+          - android12-5.10
+          - android13-5.15
+          - android14-6.1
+          - android15-6.6
+          - android16-6.12
+    container:
+      image: ghcr.io/ylarod/ddk:${{ matrix.kmi }}-20260313
+      options: --privileged
+    defaults:
+      run:
+        shell: bash
+    env:
+      KMI: ${{ matrix.kmi }}
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build kernel module
+        run: |
+          set -euo pipefail
+          make -j"$(nproc)" KDIR="${KERNEL_SRC:?KERNEL_SRC is not set}"
+          test -s dfm.ko
+
+      - name: Prepare kernel artifact
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          output="dfm-${KMI}.ko"
+          cp dfm.ko "out/$output"
+          llvm-strip --strip-debug "out/$output"
+          test -s "out/$output"
+          cd out
+          sha256sum "$output" > "$output.sha256"
+
+      - name: Upload kernel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dfm-kernel-${{ matrix.kmi }}
+          path: |
+            out/dfm-${{ matrix.kmi }}.ko
+            out/dfm-${{ matrix.kmi }}.ko.sha256
+          if-no-files-found: error
+          retention-days: 30
