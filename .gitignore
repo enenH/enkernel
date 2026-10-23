@@ -1,0 +1,27 @@
+# Build outputs
+cmake-build-*/
+build/
+out/
+*.ko
+*.o
+*.mod
+*.mod.c
+*.cmd
+.tmp_versions/
+Module.symvers
+modules.order
+
+# IDE
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python tool caches
+__pycache__/
+*.py[cod]
+
+# Local-only files
+*.local.md
