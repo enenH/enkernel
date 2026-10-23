@@ -1,4 +1,4 @@
-name: Build kernel modules
+name: Build kernel and SDK
 
 on:
   push:
@@ -65,5 +65,91 @@ jobs:
           path: |
             out/dfm-${{ matrix.kmi }}.ko
             out/dfm-${{ matrix.kmi }}.ko.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  sdk:
+    name: Build Android arm64 SDK and loader
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      NDK_VERSION: '27.1.12297006'
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Android NDK
+        run: |
+          set -euo pipefail
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION"
+
+      - name: Build and install SDK
+        run: |
+          set -euo pipefail
+          cmake -S . -B build/sdk -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_HOME/ndk/$NDK_VERSION/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 \
+            -DANDROID_STL=c++_static -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/sdk --parallel "$(nproc)"
+          cmake --install build/sdk --prefix "$PWD/out/enkernel-sdk-arm64-v8a"
+
+      - name: Verify installed SDK integration
+        run: |
+          set -euo pipefail
+          cmake -S out/enkernel-sdk-arm64-v8a/examples -B build/consumer -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_HOME/ndk/$NDK_VERSION/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 \
+            -DANDROID_STL=c++_static -DCMAKE_BUILD_TYPE=Release \
+            -Denkernel_DIR="$PWD/out/enkernel-sdk-arm64-v8a/lib/cmake/enkernel"
+          cmake --build build/consumer --parallel "$(nproc)"
+
+      - name: Upload SDK, loader and calling example
+        uses: actions/upload-artifact@v4
+        with:
+          name: enkernel-sdk-arm64-v8a
+          path: out/enkernel-sdk-arm64-v8a/
+          if-no-files-found: error
+          retention-days: 30
+
+  package:
+    name: Package SDK, loader and kernel modules
+    needs: [build, sdk]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download SDK
+        uses: actions/download-artifact@v4
+        with:
+          name: enkernel-sdk-arm64-v8a
+          path: out/enkernel-arm64-v8a
+
+      - name: Download kernel modules
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dfm-kernel-*
+          merge-multiple: true
+          path: out/enkernel-arm64-v8a/modules
+
+      - name: Verify modules and create distribution archive
+        run: |
+          set -euo pipefail
+          for kmi in android12-5.10 android13-5.15 android14-6.1 android15-6.6 android16-6.12; do
+            (cd out/enkernel-arm64-v8a/modules && sha256sum --check "dfm-$kmi.ko.sha256")
+          done
+          # Artifact ZIPs do not preserve executable permissions; the tarball does.
+          chmod 755 out/enkernel-arm64-v8a/bin/dfm_loader out/enkernel-arm64-v8a/bin/dfm_example
+          tar -C out -czf out/enkernel-arm64-v8a.tar.gz enkernel-arm64-v8a
+          cd out
+          sha256sum enkernel-arm64-v8a.tar.gz > enkernel-arm64-v8a.tar.gz.sha256
+
+      - name: Upload complete distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: enkernel-arm64-v8a
+          path: |
+            out/enkernel-arm64-v8a.tar.gz
+            out/enkernel-arm64-v8a.tar.gz.sha256
           if-no-files-found: error
           retention-days: 30
