@@ -1,4 +1,4 @@
-name: Build kernel and SDK
+name: Build and release kernel and SDK
 
 on:
   push:
@@ -107,10 +107,12 @@ jobs:
           retention-days: 30
 
   package:
-    name: Package SDK, loader and kernel modules
+    name: Package and publish release
     needs: [build, sdk]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
       - name: Download SDK
         uses: actions/download-artifact@v4
@@ -133,11 +135,15 @@ jobs:
           done
           # Artifact ZIPs do not preserve executable permissions; the tarball does.
           chmod 755 out/enkernel-arm64-v8a/bin/dfm_loader out/enkernel-arm64-v8a/bin/dfm_example
+          tar -C out/enkernel-arm64-v8a --exclude=./modules \
+            -czf out/enkernel-sdk-arm64-v8a.tar.gz .
           tar -C out -czf out/enkernel-arm64-v8a.tar.gz enkernel-arm64-v8a
           cd out
+          sha256sum enkernel-sdk-arm64-v8a.tar.gz > enkernel-sdk-arm64-v8a.tar.gz.sha256
           sha256sum enkernel-arm64-v8a.tar.gz > enkernel-arm64-v8a.tar.gz.sha256
 
-      - name: Upload complete distribution
+      - name: Upload pull request distribution
+        if: github.event_name == 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: enkernel-arm64-v8a
@@ -146,3 +152,72 @@ jobs:
             out/enkernel-arm64-v8a.tar.gz.sha256
           if-no-files-found: error
           retention-days: 30
+
+      - name: Create draft release
+        if: github.event_name != 'pull_request'
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release_name="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          # Include the run and attempt so same-day builds and retries cannot collide.
+          release_tag="$(date -u -d "$release_name" '+%Y-%m-%d-%H%M%S')-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          release_id="$(
+            gh api --method POST "repos/$GITHUB_REPOSITORY/releases" \
+              -f tag_name="$release_tag" \
+              -f target_commitish="$GITHUB_SHA" \
+              -f name="$release_name" \
+              -f body="Built from ${GITHUB_SHA}. Workflow: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}." \
+              -F draft=true \
+              --jq '.id'
+          )"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
+
+      - name: Upload, verify and publish release
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+          RELEASE_ID: ${{ steps.release.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          files=(
+            out/*.tar.gz
+            out/*.tar.gz.sha256
+            out/enkernel-arm64-v8a/modules/*.ko
+            out/enkernel-arm64-v8a/modules/*.ko.sha256
+          )
+          gh release upload "$RELEASE_TAG" "${files[@]}"
+
+          assets="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100" \
+            --paginate --jq '.[] | [.name, .size] | @tsv')"
+          for file in "${files[@]}"; do
+            name="$(basename "$file")"
+            expected_size="$(stat -c %s "$file")"
+            actual_size="$(printf '%s\n' "$assets" | awk -v name="$name" '$1 == name {print $2}')"
+            if [ "$expected_size" -le 0 ] || [ "$actual_size" != "$expected_size" ]; then
+              echo "Release asset missing or size mismatch: $name" >&2
+              exit 1
+            fi
+          done
+
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            -F draft=false -f make_latest=true >/dev/null
+
+      - name: Delete incomplete release
+        if: ${{ (failure() || cancelled()) && steps.release.outputs.release_id != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+          RELEASE_ID: ${{ steps.release.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          # A failed response after publishing must not delete a complete release.
+          draft="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq '.draft')"
+          if [ "$draft" = true ]; then
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID"
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$RELEASE_TAG" || true
+          fi
