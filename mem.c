@@ -767,9 +767,7 @@ long mem_get_thread_stack(void __user *arg)
         return -ESRCH;
 
     tls = (unsigned long)*task_user_tls(task);
-#ifdef CONFIG_ARM64
     tls = untagged_addr(tls);
-#endif
     mm = get_task_mm(task);
     if (!mm) {
         put_task_struct(task);

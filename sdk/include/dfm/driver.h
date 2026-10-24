@@ -78,7 +78,7 @@ namespace dfm {
     bool hwb_read(dfm_hwb_snapshot& out);
     bool hwb_clear();
     /* Raw result of the most recent issued ioctl on this thread (negative errno).
-     * Argument validation can fail before issuing an ioctl. libc errno is unused. */
+     * Argument validation can fail before issuing an ioctl; do not rely on libc errno. */
     long last_ioctl_result();
 
     bool udp_cap_init(int pid, uint16_t minPayload = 16,

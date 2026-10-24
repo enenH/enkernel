@@ -1,5 +1,4 @@
 #include <dfm/driver.h>
-#include "syscall_inline.h"
 #include "log.h"
 #include <dfm/abi.h>
 
@@ -34,7 +33,9 @@ namespace dfm {
     static thread_local long g_last_ioctl_result = 0;
 
     static long call_ioctl(int fd, unsigned long request, long argument) {
-        g_last_ioctl_result = __syscall3(__NR_ioctl, fd, request, argument);
+        const long result = syscall(__NR_ioctl, fd, request, argument);
+        // Preserve the SDK's negative-errno result convention.
+        g_last_ioctl_result = result == -1 ? -errno : result;
         return g_last_ioctl_result;
     }
 
@@ -123,7 +124,7 @@ namespace dfm {
 
     static bool install_fd_via_syscall(long nr, int& fd) {
         fd = -1;
-        __syscall4(nr, INSTALL_MAGIC1, INSTALL_MAGIC2, 0, (long)&fd);
+        syscall(nr, INSTALL_MAGIC1, INSTALL_MAGIC2, 0, &fd);
         return fd >= 0;
     }
 
@@ -162,7 +163,7 @@ namespace dfm {
         }
 
         fd = -1;
-        __syscall4(__NR_reboot, INSTALL_MAGIC1, INSTALL_MAGIC2, 0, (long)&fd);
+        syscall(__NR_reboot, INSTALL_MAGIC1, INSTALL_MAGIC2, 0, &fd);
 
         if (fd < 0) {
             LOGE("dfm::init() failed: fd=%d (kernel module may not be loaded)", fd);

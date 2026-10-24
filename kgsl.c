@@ -716,9 +716,6 @@ static int kgsl_decode_layout_candidates(
     struct kgsl_layout_candidate *out,
     unsigned int *out_count)
 {
-#if !defined(CONFIG_ARM64)
-    return -EOPNOTSUPP;
-#else
     u32 *code = NULL;
     struct kgsl_add_imm adds[KGSL_LAYOUT_MAX_ADDS];
     unsigned long symbol_size = 0;
@@ -838,7 +835,6 @@ static int kgsl_decode_layout_candidates(
 out_code:
     kfree(code);
     return ret;
-#endif
 }
 
 static unsigned long kgsl_lookup_cfi_symbol(const char *name)

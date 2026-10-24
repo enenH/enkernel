@@ -2,7 +2,6 @@
 #include "loader_elf.h"
 
 #include <dfm/driver.h>
-#include "syscall_inline.h"
 #include "log.h"
 
 #include <fcntl.h>
@@ -218,11 +217,11 @@ private:
 
 long insert_module(const std::string& image, const std::string& params)
 {
-    const long result = __syscall3(__NR_init_module, reinterpret_cast<intptr_t>(image.data()),
-                                    image.size(), reinterpret_cast<intptr_t>(params.c_str()));
-    // syscall_inline.h returns a raw negative errno; it does NOT set errno.
-    if (result < 0)
+    long result = syscall(__NR_init_module, image.data(), image.size(), params.c_str());
+    if (result == -1) {
+        result = -errno;
         LOGE("loader: init_module ret=%ld: %s", result, strerror(int(-result)));
+    }
     return result;
 }
 

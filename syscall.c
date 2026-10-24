@@ -1,6 +1,8 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
-#ifdef __aarch64__
+#ifndef __aarch64__
+#error "DFM kernel module requires ARM64"
+#endif
 
 #include <linux/atomic.h>
 #include <linux/compiler.h>
@@ -281,25 +283,3 @@ int syscall_hook_nr(void)
 {
     return g_hooked_nr;
 }
-
-#else
-
-#include <linux/errno.h>
-
-#include "syscall.h"
-
-int syscall_hook_init(void)
-{
-    return -EOPNOTSUPP;
-}
-
-void syscall_hook_exit(void)
-{
-}
-
-int syscall_hook_nr(void)
-{
-    return -1;
-}
-
-#endif

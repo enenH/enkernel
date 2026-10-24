@@ -15,7 +15,9 @@
  * copies or substantial portions of the Software.
  */
 
-#ifdef __aarch64__
+#ifndef __aarch64__
+#error "DFM kernel module requires ARM64"
+#endif
 
 #include <linux/bitmap.h>
 #include <linux/build_bug.h>
@@ -1946,44 +1948,3 @@ void dfm_hwb_exit(void)
     g_hwb.snapshots[1] = NULL;
     mutex_unlock(&g_hwb_mutex);
 }
-
-#else
-
-#include <linux/errno.h>
-
-#include "dfm_hwb.h"
-
-long dfm_hwb_info(void __user *arg)
-{
-    return -EOPNOTSUPP;
-}
-
-long dfm_hwb_slots(void __user *arg)
-{
-    return -EOPNOTSUPP;
-}
-
-long dfm_hwb_set(struct file *owner, void __user *arg)
-{
-    return -EOPNOTSUPP;
-}
-
-long dfm_hwb_read(void __user *arg)
-{
-    return -EOPNOTSUPP;
-}
-
-long dfm_hwb_clear(void)
-{
-    return -EOPNOTSUPP;
-}
-
-void dfm_hwb_release_owner(struct file *owner)
-{
-}
-
-void dfm_hwb_exit(void)
-{
-}
-
-#endif
