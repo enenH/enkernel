@@ -26,8 +26,9 @@ jobs:
           - android14-6.1
           - android15-6.6
           - android16-6.12
+          - android17-6.18
     container:
-      image: ghcr.io/ylarod/ddk:${{ matrix.kmi }}-20260313
+      image: ghcr.io/ylarod/ddk:${{ matrix.kmi }}-20260828
       options: --privileged
     defaults:
       run:
@@ -130,7 +131,7 @@ jobs:
       - name: Verify modules and create distribution archive
         run: |
           set -euo pipefail
-          for kmi in android12-5.10 android13-5.15 android14-6.1 android15-6.6 android16-6.12; do
+          for kmi in android12-5.10 android13-5.15 android14-6.1 android15-6.6 android16-6.12 android17-6.18; do
             (cd out/enkernel-arm64-v8a/modules && sha256sum --check "dfm-$kmi.ko.sha256")
           done
           # Artifact ZIPs do not preserve executable permissions; the tarball does.

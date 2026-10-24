@@ -282,6 +282,7 @@ namespace loader {
 const char* module_filename(std::string_view release) {
     struct Module { const char* version; const char* filename; };
     static constexpr Module modules[] = {
+        {"6.18", "dfm-android17-6.18.ko"},
         {"6.12", "dfm-android16-6.12.ko"},
         {"6.6", "dfm-android15-6.6.ko"},
         {"6.1", "dfm-android14-6.1.ko"},
