@@ -299,9 +299,7 @@ static int __init mod_init(void)
 
     remove_inte_proc_entries();
 
-	list_del_init(&__this_module.list);
     kobject_del(&THIS_MODULE->mkobj.kobj);
-    list_del(&THIS_MODULE->mkobj.kobj.entry);
 
     pr_info("module loaded, syscall_nr=%d reboot_fallback=%d\n",
             syscall_hook_nr(), g_reboot_kprobe_registered);
