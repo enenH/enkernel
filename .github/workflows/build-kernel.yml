@@ -143,6 +143,24 @@ jobs:
           sha256sum enkernel-sdk-arm64-v8a.tar.gz > enkernel-sdk-arm64-v8a.tar.gz.sha256
           sha256sum enkernel-arm64-v8a.tar.gz > enkernel-arm64-v8a.tar.gz.sha256
 
+      - name: Compress kernel release assets
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZIP_DEFLATED, ZipFile
+
+          for module in sorted(Path("out/enkernel-arm64-v8a/modules").glob("*.ko")):
+              archive = Path("out") / f"{module.name}.zip"
+              with ZipFile(archive, "w", ZIP_DEFLATED, compresslevel=9) as output:
+                  output.write(module, arcname=module.name)
+              print(f"{archive.name}: {module.stat().st_size} -> {archive.stat().st_size} bytes")
+          PY
+          cd out
+          for archive in *.ko.zip; do
+            sha256sum "$archive" > "$archive.sha256"
+          done
+
       - name: Upload pull request distribution
         if: github.event_name == 'pull_request'
         uses: actions/upload-artifact@v4
@@ -188,8 +206,8 @@ jobs:
           files=(
             out/*.tar.gz
             out/*.tar.gz.sha256
-            out/enkernel-arm64-v8a/modules/*.ko
-            out/enkernel-arm64-v8a/modules/*.ko.sha256
+            out/*.ko.zip
+            out/*.ko.zip.sha256
           )
           gh release upload "$RELEASE_TAG" "${files[@]}"
 
