@@ -52,6 +52,18 @@
 #define MEM_IOC_OPEN_PROCESS_MEM _IOWR('D', 36, struct mem_open_process_mem_req)
 /* This command is accepted only by the returned process-memory fd. */
 #define MEM_PROCESS_MEM_IOC_ARM _IOW('D', 37, struct mem_process_mem_arm_req)
+#define DFM_CPU_CLOCK_IOC_SET_TARGET \
+    _IOW('D', 38, struct dfm_cpu_clock_target_req)
+
+/* One TGID in the caller's PID namespace; 0 disables, negative PIDs and
+ * non-leader TIDs are invalid. External PROF/VIRT/SCHED CPU time is divided
+ * by 64; the target's own clocks and existing access checks stay unchanged.
+ * Configuration outlives the fd and binds the process instance, not its PID
+ * number. Repeating the same target is idempotent. Observers must discard
+ * their sampling baseline when this mapping is enabled or disabled. */
+struct dfm_cpu_clock_target_req {
+    int32_t pid;
+};
 
 #define MEM_PROCESS_MEM_ABI_VERSION 1U
 #define MEM_PROCESS_MEM_IO_MAX 4096U

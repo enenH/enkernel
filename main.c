@@ -108,6 +108,8 @@ static long drv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         return dfm_file_write(argp);
     case DFM_CRED_IOC_ACQUIRE_SF_GROUPS:
         return dfm_sf_groups_acquire(argp);
+    case DFM_CPU_CLOCK_IOC_SET_TARGET:
+        return syscall_cpu_clock_set_target(argp);
     default:
         return -ENOTTY;
     }
@@ -295,6 +297,10 @@ static int __init mod_init(void)
         return reboot_ret;
     }
 
+    ret = syscall_cpu_clock_init();
+    if (ret < 0)
+        pr_warn("CPU-clock mitigation unavailable: %d\n", ret);
+
     (void)kgsl_hide_init();
 
     remove_inte_proc_entries();
@@ -308,6 +314,7 @@ static int __init mod_init(void)
 
 static void __exit mod_exit(void)
 {
+    syscall_cpu_clock_exit();
     kgsl_hide_exit();
     if (g_reboot_kprobe_registered) {
         unregister_kprobe(&kp_reboot);
