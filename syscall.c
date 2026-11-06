@@ -307,8 +307,10 @@ int syscall_hook_nr(void)
 
 /* A syscall-table reader may have fetched our address before restoration,
  * and copy_to_user() can sleep. Both Tasks RCU and SRCU are required for
- * teardown; ordinary RCU alone does not protect this call path. */
-#if defined(CONFIG_TASKS_RCU) && defined(CONFIG_SRCU)
+ * teardown; ordinary RCU alone does not protect this call path.
+ * Newer kernels removed CONFIG_SRCU while retaining TREE_SRCU/TINY_SRCU. */
+#if defined(CONFIG_TASKS_RCU) && \
+    (defined(CONFIG_SRCU) || defined(CONFIG_TREE_SRCU) || defined(CONFIG_TINY_SRCU))
 
 typedef int (*cpu_clock_get_fn_t)(clockid_t clock, struct timespec64 *ts);
 

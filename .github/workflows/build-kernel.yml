@@ -48,6 +48,16 @@ jobs:
           make -j"$(nproc)" KDIR="${KERNEL_SRC:?KERNEL_SRC is not set}"
           test -s dfm.ko
 
+      - name: Verify CPU-clock implementation
+        run: |
+          set -euo pipefail
+          # The public entry points also exist in unsupported builds. Require
+          # the native handler from the actual Tasks RCU/SRCU implementation.
+          if ! llvm-nm --defined-only dfm.ko | awk '$NF ~ /^cpu_clock_native([.]|$)/ { found = 1 } END { exit !found }'; then
+            echo "CPU-clock implementation missing for $KMI; check Tasks RCU/SRCU configuration" >&2
+            exit 1
+          fi
+
       - name: Prepare kernel artifact
         run: |
           set -euo pipefail
