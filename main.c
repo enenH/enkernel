@@ -28,6 +28,7 @@
 #include "udp_capture.h"
 #include "file_io.h"
 #include "sf_groups.h"
+#include "futex.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DFM");
@@ -40,6 +41,16 @@ static long drv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     void __user *argp = (void __user *)arg;
 
     switch (cmd) {
+    case MEM_IOC_CAPABILITIES:
+        return dfm_capabilities(argp);
+    case MEM_IOC_FUTEX_WAITERS:
+        return dfm_futex_waiters(filp, argp);
+    case MEM_IOC_FUTEX_VALIDATE:
+        return dfm_futex_validate(filp, argp);
+    case UDP_IOC_BIND_FD:
+        return udp_capture_bind_fd(argp);
+    case UDP_IOC_READ_V2:
+        return udp_capture_read_v2(argp);
     case MEM_IOC_OPEN_PROCESS_MEM:
         return mem_open_process_mem(argp);
     case MEM_IOC_READ:
@@ -117,6 +128,7 @@ static long drv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 static int drv_release(struct inode *inode, struct file *filp)
 {
+    dfm_futex_release(filp);
     dfm_hwb_release_owner(filp);
     udp_capture_stop();
     touch_v2_release_all();

@@ -55,6 +55,87 @@
 #define DFM_CPU_CLOCK_IOC_SET_TARGET \
     _IOW('D', 38, struct dfm_cpu_clock_target_req)
 
+#define MEM_IOC_FUTEX_WAITERS     _IOWR('D', 39, struct dfm_futex_waiters_req)
+#define MEM_IOC_FUTEX_VALIDATE    _IOW('D', 40, struct dfm_futex_validate_req)
+#define UDP_IOC_BIND_FD           _IOWR('D', 41, struct udp_cap_bind_req)
+#define MEM_IOC_CAPABILITIES      _IOWR('D', 42, struct dfm_capabilities_req)
+#define UDP_IOC_READ_V2           _IOWR('D', 44, struct udp_cap_read_v2_req)
+
+#define DFM_CAPABILITIES_ABI_VERSION 1U
+#define DFM_CAP_FUTEX_THREADS    (1ULL << 0)
+#define DFM_CAP_UDP_SOCKET_BIND  (1ULL << 1)
+#define DFM_CAP_UDP_CAPTURE_V2   (1ULL << 2)
+#define DFM_CAP_REQUIRED (DFM_CAP_FUTEX_THREADS | DFM_CAP_UDP_SOCKET_BIND | DFM_CAP_UDP_CAPTURE_V2)
+/* Read-only handshake. A version-0 request is rejected before any operation.
+ * Features describe implemented transports, not a guarantee that every target
+ * task or kernel sleep site can be sampled. Runtime errors stay explicit. */
+struct dfm_capabilities_req {
+    uint32_t abi_version;
+    uint32_t out_abi_version;
+    uint64_t out_features;
+    uint64_t reserved[2];
+};
+
+#define DFM_FUTEX_ABI_VERSION 1U
+#define DFM_FUTEX_MAX_THREADS 64U
+#define DFM_FUTEX_WAIT 0U
+#define DFM_FUTEX_WAKE 1U
+#define DFM_FUTEX_WAIT_BITSET 9U
+#define DFM_FUTEX_WAKE_BITSET 10U
+#define DFM_FUTEX_PRIVATE_FLAG 128U
+#define DFM_FUTEX_BITSET_MATCH_ANY 0xffffffffU
+
+/* An observed AArch64 waiter, never a stopped or modified target thread.
+ * All registers and TLS come from one stable inactive interval. context_id
+ * names an opaque file-owned pinned task/mm session, not a kernel address.
+ * Validation must succeed before an emulated result using it is published. */
+struct dfm_futex_thread {
+    uint64_t x[31], sp, pc, tls, tpidrro;
+    uint8_t v[32][16];
+    uint32_t pstate, fpcr, fpsr;
+    int32_t pid, tid;
+    uint32_t reserved;
+    uint64_t syscall_nr, args[6], identity, sequence, context_id;
+};
+struct dfm_futex_waiters_req {
+    uint32_t version;
+    int32_t pid;
+    uint64_t address;
+    uint32_t operation, bitset;
+    uint64_t out_threads;
+    uint32_t capacity, out_count;
+    uint64_t reserved[2];
+};
+struct dfm_futex_validate_req {
+    uint32_t version;
+    int32_t pid;
+    uint64_t snapshot;
+    uint64_t reserved[2];
+};
+
+#define UDP_CAP_BIND_ABI_VERSION 1U
+struct udp_cap_bind_req {
+    uint32_t version;
+    int32_t pid;
+    int32_t target_fd;
+    uint32_t flags;
+    uint64_t out_generation;
+    /* CLOCK_MONOTONIC proof time of this successful bind, including an
+     * idempotent rebind. Only a changed exact socket flushes queued packets. */
+    uint64_t out_cutover_ns;
+    uint64_t reserved[2];
+};
+#define UDP_CAP_READ_ABI_VERSION 1U
+#define UDP_CAP_STATE_RUNNING (1U << 0)
+#define UDP_CAP_STATE_EXACT_BOUND (1U << 1)
+struct udp_cap_read_v2_req {
+    uint32_t version, reserved;
+    uint64_t buf;
+    uint32_t max_count, out_count;
+    uint64_t overflow, captured, generation, cutover_ns;
+    uint32_t out_flags, reserved2;
+};
+
 /* One TGID in the caller's PID namespace; 0 disables, negative PIDs and
  * non-leader TIDs are invalid. External PROF/VIRT/SCHED CPU time is divided
  * by 64; the target's own clocks and existing access checks stay unchanged.
