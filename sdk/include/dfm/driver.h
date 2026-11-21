@@ -119,6 +119,8 @@ namespace dfm {
     long query_access(int pid, uint64_t addr, mem_query_access_req& out);
     bool supports_process_mem();
     // Restricted system_server/libsensorservice session; caller owns out_fd.
+    // SystemUI uses a root-delegated driver fd and DFM_CAP_SENSOR_SYSTEMUI;
+    // a fresh dfm::init() from an unprivileged process does not grant this role.
     long open_process_mem(int pid, mem_open_process_mem_req& out);
     // Reuses QUERY_ACCESS on the session's bound mm, not a freshly resolved PID.
     long query_process_mem_access(int fd, int pid, uint64_t addr,

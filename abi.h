@@ -67,6 +67,7 @@
 #define DFM_CAP_UDP_SOCKET_BIND  (1ULL << 1)
 #define DFM_CAP_UDP_CAPTURE_V2   (1ULL << 2)
 #define DFM_CAP_FILE_QUERY_FD    (1ULL << 3)
+#define DFM_CAP_SENSOR_SYSTEMUI  (1ULL << 4)
 #define DFM_CAP_REQUIRED (DFM_CAP_FUTEX_THREADS | DFM_CAP_UDP_SOCKET_BIND | DFM_CAP_UDP_CAPTURE_V2)
 /* Read-only handshake. A version-0 request is rejected before any operation.
  * Features describe implemented transports, not a guarantee that every target
@@ -190,6 +191,10 @@ struct dfm_cpu_clock_target_req {
 #define MEM_PROCESS_MEM_IO_MAX 4096U
 
 /* Restricted lab session: system_server /system/lib64/libsensorservice.so only.
+ * Callers: root, verified SurfaceFlinger, or com.android.systemui using an
+ * existing driver fd opened by root and explicitly delegated to it. SystemUI
+ * keeps its own UID; opening a new unprivileged driver fd is not delegation.
+ * DFM_CAP_SENSOR_SYSTEMUI advertises the latter policy (not gyro injection).
  * version=0 is a non-mutating capability probe, rejected with -EINVAL.
  * pread/pwrite offsets are target VAs; QUERY_ACCESS also works on this fd.
  * The fd is owner-TGID-bound, CLOEXEC, and rejects an exited/replaced mm.

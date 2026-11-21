@@ -53,7 +53,7 @@ static long drv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     case UDP_IOC_READ_V2:
         return udp_capture_read_v2(argp);
     case MEM_IOC_OPEN_PROCESS_MEM:
-        return mem_open_process_mem(argp);
+        return mem_open_process_mem(filp, argp);
     case MEM_IOC_READ:
         return mem_read(argp);
     case MEM_IOC_READ_CACHE:

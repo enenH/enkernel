@@ -30,6 +30,7 @@
 #include "mem.h"
 #include "process_mem.h"
 #include "sf_groups.h"
+#include "process_mem_policy.h"
 
 #define SENSOR_LIBRARY "/system/lib64/libsensorservice.so"
 #define SENSOR_CAVE_SIZE 64U
@@ -46,18 +47,69 @@ struct process_mem_session {
 };
 
 static DEFINE_MUTEX(session_lock);
-/* Both launch modes must serialize ownership of the system-wide GOT slot. */
+/* All permitted callers serialize ownership of the system-wide GOT slot. */
 static struct process_mem_session *active_session;
 
-static bool caller_allowed(void)
+static bool root_credentials(const struct cred *cred)
+{
+    return cred && cred->user_ns == &init_user_ns &&
+           uid_eq(cred->uid, GLOBAL_ROOT_UID) &&
+           uid_eq(cred->euid, GLOBAL_ROOT_UID);
+}
+
+static bool systemui_caller(struct file *driver_file)
+{
+    const struct cred *cred = current_cred();
+    struct mm_struct *mm = current->mm;
+    struct file *exe;
+    struct inode *inode;
+    unsigned long start, end;
+    char name[sizeof(DFM_SYSTEMUI_NAME)] = {};
+    char *buffer, *path;
+    bool allowed = false;
+
+    /* The existing root launcher passes its driver fd via SCM_RIGHTS. This
+     * preserves file->f_cred; SystemUI never gets root credentials itself. */
+    if (!driver_file || !root_credentials(driver_file->f_cred) || !mm ||
+        cred->user_ns != &init_user_ns ||
+        !uid_eq(cred->uid, cred->euid) || !uid_eq(cred->uid, cred->suid) ||
+        !uid_eq(cred->uid, cred->fsuid))
+        return false;
+    spin_lock(&mm->arg_lock);
+    start = mm->arg_start;
+    end = mm->arg_end;
+    spin_unlock(&mm->arg_lock);
+    /* Check full argv[0], not TASK_COMM_LEN's truncated worker/thread name. */
+    if (end < start || end - start < sizeof(name) ||
+        copy_from_user(name, (const void __user *)start, sizeof(name)) ||
+        memcmp(name, DFM_SYSTEMUI_NAME, sizeof(name)))
+        return false;
+    exe = get_task_exe_file(current->group_leader);
+    if (!exe)
+        return false;
+    buffer = (char *)__get_free_page(GFP_KERNEL);
+    if (!buffer)
+        goto out;
+    path = d_path(&exe->f_path, buffer, PAGE_SIZE);
+    inode = file_inode(exe);
+    if (!IS_ERR(path))
+        allowed = dfm_sensor_systemui_policy(true, true,
+            __kuid_val(cred->uid), true,
+            uid_eq(inode->i_uid, GLOBAL_ROOT_UID) &&
+                !(inode->i_mode & (S_IWGRP | S_IWOTH)), name, path);
+    free_page((unsigned long)buffer);
+out:
+    fput(exe);
+    return allowed;
+}
+
+static bool caller_allowed(struct file *driver_file)
 {
     const struct cred *cred = current_cred();
 
-    if (cred->user_ns == &init_user_ns &&
-        uid_eq(cred->uid, GLOBAL_ROOT_UID) &&
-        uid_eq(cred->euid, GLOBAL_ROOT_UID))
+    if (root_credentials(cred))
         return true;
-    return dfm_is_surfaceflinger_caller();
+    return dfm_is_surfaceflinger_caller() || systemui_caller(driver_file);
 }
 
 static struct mm_struct *live_mm(struct process_mem_session *session)
@@ -374,7 +426,7 @@ static const struct file_operations process_mem_fops = {
     .release = process_mem_release,
 };
 
-long mem_open_process_mem(void __user *arg)
+long mem_open_process_mem(struct file *driver_file, void __user *arg)
 {
     struct mem_open_process_mem_req req;
     struct process_mem_session *session;
@@ -391,7 +443,7 @@ long mem_open_process_mem(void __user *arg)
     if (copy_from_user(&req, arg, sizeof(req))) return -EFAULT;
     if (req.version != MEM_PROCESS_MEM_ABI_VERSION || req.reserved || req.pid <= 0)
         return -EINVAL;
-    if (!caller_allowed()) return -EACCES;
+    if (!caller_allowed(driver_file)) return -EACCES;
     session = kzalloc(sizeof(*session), GFP_KERNEL);
     path_buf = (char *)__get_free_page(GFP_KERNEL);
     if (!session || !path_buf) {
