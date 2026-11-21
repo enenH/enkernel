@@ -4,6 +4,7 @@
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/kdev_t.h>
+#include <linux/mm.h>
 #include <linux/overflow.h>
 #include <linux/pid.h>
 #include <linux/rcupdate.h>
