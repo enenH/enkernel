@@ -27,6 +27,7 @@
 #include "dfm_hwb.h"
 #include "udp_capture.h"
 #include "file_io.h"
+#include "fd_query.h"
 #include "sf_groups.h"
 #include "futex.h"
 
@@ -115,6 +116,8 @@ static long drv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         return udp_capture_stop();
     case DFM_FILE_IOC_READ:
         return dfm_file_read(argp);
+    case DFM_FILE_IOC_QUERY_FD:
+        return dfm_file_query_fd(argp);
     case DFM_FILE_IOC_WRITE:
         return dfm_file_write(argp);
     case DFM_CRED_IOC_ACQUIRE_SF_GROUPS:

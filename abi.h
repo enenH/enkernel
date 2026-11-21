@@ -60,11 +60,13 @@
 #define UDP_IOC_BIND_FD           _IOWR('D', 41, struct udp_cap_bind_req)
 #define MEM_IOC_CAPABILITIES      _IOWR('D', 42, struct dfm_capabilities_req)
 #define UDP_IOC_READ_V2           _IOWR('D', 44, struct udp_cap_read_v2_req)
+#define DFM_FILE_IOC_QUERY_FD     _IOWR('D', 45, struct dfm_file_query_req)
 
 #define DFM_CAPABILITIES_ABI_VERSION 1U
 #define DFM_CAP_FUTEX_THREADS    (1ULL << 0)
 #define DFM_CAP_UDP_SOCKET_BIND  (1ULL << 1)
 #define DFM_CAP_UDP_CAPTURE_V2   (1ULL << 2)
+#define DFM_CAP_FILE_QUERY_FD    (1ULL << 3)
 #define DFM_CAP_REQUIRED (DFM_CAP_FUTEX_THREADS | DFM_CAP_UDP_SOCKET_BIND | DFM_CAP_UDP_CAPTURE_V2)
 /* Read-only handshake. A version-0 request is rejected before any operation.
  * Features describe implemented transports, not a guarantee that every target
@@ -73,6 +75,44 @@ struct dfm_capabilities_req {
     uint32_t abi_version;
     uint32_t out_abi_version;
     uint64_t out_features;
+    uint64_t reserved[2];
+};
+
+/* Read-only regular-file operations addressed by target PID/FD. The driver fd
+ * grants access, as for KGSL_QUERY. One file reference pins the lookup for each
+ * request; calls are not a cross-call snapshot and fd numbers can be reused.
+ * No local fd is installed, no pathname is supplied, and target f_pos is never
+ * changed (not even temporarily). Filesystem access/atime effects may occur.
+ *
+ * INFO: offset/whence/buf/size must be zero.
+ * PREAD: offset >= 0, size 1..MAX_READ, whence zero. Short reads/EOF succeed.
+ * SEEK: offset is signed; whence uses Linux SEEK_SET/CUR/END/DATA/HOLE (0..4).
+ *       CUR is relative to the sampled target position, not a prior query.
+ *       DATA/HOLE use the filesystem's implementation, never an approximation.
+ * All flags/reserved/unused inputs must be zero. Outputs are cleared per call.
+ * ioctl < 0: malformed request, transport, task lookup or allocation failure.
+ * ioctl == 0: inspect positive out_errno for a file-operation error; outputs
+ *             are valid only when out_errno == 0. PREAD bytes beyond out_size
+ *             are unspecified. No bytes are copied on a file-operation error.
+ * ENOTTY from ioctl means this ABI is unavailable; no userspace fallback.
+ */
+#define DFM_FILE_QUERY_ABI_VERSION 1U
+#define DFM_FILE_QUERY_INFO  1U
+#define DFM_FILE_QUERY_PREAD 2U
+#define DFM_FILE_QUERY_SEEK  3U
+#define DFM_FILE_QUERY_MAX_READ (1024U * 1024U)
+struct dfm_file_query_req {
+    uint32_t abi_version, op;
+    int32_t pid;
+    uint32_t target_fd;
+    uint64_t buf, size;
+    int64_t offset;
+    uint32_t whence, flags;
+    uint64_t out_size;
+    int64_t out_result; /* SEEK result; zero for INFO/PREAD */
+    uint64_t out_file_size, out_position, out_inode, out_device;
+    uint32_t out_mode; /* Linux st_mode bits */
+    int32_t out_errno;
     uint64_t reserved[2];
 };
 

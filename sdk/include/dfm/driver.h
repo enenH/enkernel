@@ -72,6 +72,13 @@ namespace dfm {
      * No legacy caller-fd or userspace-system-call fallback. */
     long query_kgsl(dfm_kgsl_query_req& request);
 
+    /* Regular-file INFO/PREAD/SEEK through an existing target PID/FD. No local
+     * target fd, path proxy, process mutation or userspace fallback. The kernel
+     * pins one file per request and never changes its offset. Return 0 requires
+     * checking positive out_errno; negative returns are infrastructure errors.
+     * See dfm_file_query_req for bounds, concurrency and SEEK_CUR semantics. */
+    long query_file(dfm_file_query_req& request);
+
     bool hwb_info(dfm_hwb_info_req& out);
     bool hwb_slots(int targetTid, dfm_hwb_slots_req& out);
     bool hwb_set(int targetTid, const dfm_hwb_point_req* points, size_t pointCount);

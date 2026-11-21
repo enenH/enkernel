@@ -3,3 +3,7 @@ project(enkernel VERSION 0.1.0 LANGUAGES CXX)
 
 # Kernel modules use the root Makefile; CMake builds the Android userspace SDK.
 add_subdirectory(sdk)
+option(ENKERNEL_BUILD_TESTS "Build on-device ABI regression tests" OFF)
+if(ENKERNEL_BUILD_TESTS)
+    add_subdirectory(tests)
+endif()

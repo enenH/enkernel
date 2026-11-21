@@ -26,6 +26,11 @@ static_assert(sizeof(mem_query_signal_req) == 72U);
 static_assert(offsetof(mem_query_signal_req, out_alt_sp) == 48U);
 static_assert(offsetof(mem_query_mapping_req, out_phys_addr) == 16U);
 static_assert(sizeof(dfm_file_io_req) == 304U);
+static_assert(sizeof(dfm_file_query_req) == 120U);
+static_assert(offsetof(dfm_file_query_req, buf) == 16U);
+static_assert(offsetof(dfm_file_query_req, offset) == 32U);
+static_assert(offsetof(dfm_file_query_req, out_size) == 48U);
+static_assert(offsetof(dfm_file_query_req, reserved) == 104U);
 static_assert(sizeof(dfm_sf_groups_req) == 32U);
 
 namespace dfm {
@@ -385,6 +390,51 @@ namespace dfm {
 
         out_result = req.out_result;
         return true;
+    }
+
+    long query_file(dfm_file_query_req& req) {
+        req.abi_version = DFM_FILE_QUERY_ABI_VERSION;
+        req.out_size = req.out_file_size = req.out_position = 0;
+        req.out_inode = req.out_device = req.out_mode = 0;
+        req.out_result = req.out_errno = 0;
+        if (g_fd < 0)
+            return -EBADF;
+        if (req.pid <= 0 || req.target_fd > INT32_MAX || req.flags ||
+            req.reserved[0] || req.reserved[1])
+            return -EINVAL;
+        switch (req.op) {
+        case DFM_FILE_QUERY_INFO:
+            if (req.offset || req.whence || req.buf || req.size)
+                return -EINVAL;
+            break;
+        case DFM_FILE_QUERY_PREAD:
+            if (req.offset < 0 || req.whence || !req.size)
+                return -EINVAL;
+            if (req.size > DFM_FILE_QUERY_MAX_READ)
+                return -E2BIG;
+            if (req.size > uint64_t(INT64_MAX) - uint64_t(req.offset))
+                return -EOVERFLOW;
+            if (!req.buf)
+                return -EFAULT;
+            break;
+        case DFM_FILE_QUERY_SEEK:
+            if (req.buf || req.size || req.whence > 4U)
+                return -EINVAL;
+            break;
+        default:
+            return -EINVAL;
+        }
+        const uint32_t op = req.op;
+        const long result = call_ioctl(g_fd, DFM_FILE_IOC_QUERY_FD, (long)&req);
+        if (result < 0)
+            return result;
+        if (result != 0 || req.abi_version != DFM_FILE_QUERY_ABI_VERSION ||
+            req.op != op || req.out_errno < 0 || req.out_errno > 4095 ||
+            req.out_size > req.size || req.out_result < 0 ||
+            (op != DFM_FILE_QUERY_PREAD && req.out_size) ||
+            (op != DFM_FILE_QUERY_SEEK && req.out_result))
+            return -EPROTO;
+        return 0;
     }
 
     long query_kgsl(dfm_kgsl_query_req& req) {
