@@ -4,6 +4,22 @@ obj-m := $(MODULE_NAME).o
 
 ccflags-y += -Wno-unused-function -Wno-declaration-after-statement -Wno-gcc-compat
 
+# Inspect the selected kernel tree: vendors backport swap ABI changes.
+ifneq ($(wildcard $(srctree)/mm/swap_state.c),)
+ifneq ($(shell grep -l '^struct folio \*read_swap_cache_async' $(srctree)/mm/swap_state.c),)
+ccflags-y += -DDFM_SWAP_READ_FOLIO
+endif
+ifneq ($(shell grep -l 'struct swap_iocb' $(srctree)/mm/page_io.c),)
+ccflags-y += -DDFM_SWAP_READ_PLUG
+endif
+ifneq ($(shell grep -l 'extern void swap_free_nr' $(srctree)/include/linux/swap.h),)
+ccflags-y += -DDFM_SWAP_FREE_NR
+endif
+ifneq ($(shell grep -l 'folio_lock_killable' $(srctree)/include/linux/pagemap.h),)
+ccflags-y += -DDFM_SWAP_FOLIO_LOCKS
+endif
+endif
+
 KDIR ?= /lib/modules/$(shell uname -r)/build
 MDIR := $(realpath $(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 

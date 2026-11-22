@@ -1056,318 +1056,21 @@ static int create_linearmap(void)
     return retval;
 }
 
-static unsigned long ____phys_to_virt_nc(unsigned long pa)
+/* Locked resident RAM copies plus swap-cache backing reads. */
+#include "mem_read_backend.h"
+
+static long access_remote_vm_read(pid_t pid, unsigned long address,
+                                  void __user *buffer, size_t count, bool clean)
 {
-    down_read(&__linearmap_rwlock);
-
-    if (!__linearmap_info_arr || !__linearmap_info_ok) {
-        up_read(&__linearmap_rwlock);
-        return 0;
-    }
-
-    for (unsigned long i = 0; i < __linearmap_info_cnt; i++) {
-        unsigned long phys = __linearmap_info_arr[i].phys;
-        unsigned long size = __linearmap_info_arr[i].size;
-
-        if (pa >= phys && pa < phys + size) {
-            unsigned long offset = pa - phys;
-            unsigned long base = __linearmap_info_arr[i].virt_nc;
-
-            up_read(&__linearmap_rwlock);
-            return base ? (base + offset) : 0;
-        }
-    }
-
-    up_read(&__linearmap_rwlock);
-    return 0;
-}
-
-/* ---- follow_phys_fast page table walker ---- */
-
-#ifndef pmd_cont
-#define pmd_cont(x) 0
-#endif
-
-#ifndef pmd_leaf_size
-#define pmd_leaf_size(x) PMD_SIZE
-#endif
-
-#ifndef CONT_PMD_SIZE
-#define CONT_PMD_SIZE PMD_SIZE
-#endif
-
-static unsigned long follow_phys_fast(struct mm_struct *mm, unsigned long virt, size_t *sz)
-{
-    pgd_t *pgdp = pgd_offset(mm, virt);
-
-    if (pgd_none(*pgdp) || pgd_bad(*pgdp))
-        return ~0UL;
-
-    p4d_t *p4dp = p4d_offset(pgdp, virt);
-    if (p4d_none(*p4dp) || p4d_bad(*p4dp))
-        return ~0UL;
-
-    pud_t *pudp = pud_offset(p4dp, virt);
-    if (pud_none(*pudp))
-        return ~0UL;
-
-    if (pud_leaf(*pudp)) {
-        unsigned long pfn = pud_pfn(*pudp);
-        if (!pfn)
-            return ~0UL;
-        if (sz)
-            *sz = PUD_SIZE - (virt & ~PUD_MASK);
-        return PFN_PHYS(pfn) | (virt & ~PUD_MASK);
-    }
-
-    pmd_t *pmdp = pmd_offset(pudp, virt);
-    if (pmd_none(*pmdp))
-        return ~0UL;
-
-    if (pmd_leaf(*pmdp)) {
-        unsigned long pfn = pmd_pfn(*pmdp);
-        unsigned long offset;
-        unsigned long grp_size;
-        phys_addr_t phys;
-
-        if (!pfn)
-            return ~0UL;
-
-        if (pmd_cont(*pmdp)) {
-            unsigned long grp_mask = CONT_PMD_MASK;
-            unsigned long base_va;
-            pmd_t *first;
-
-            grp_size = CONT_PMD_SIZE;
-            offset = virt & ~grp_mask;
-            base_va = virt & grp_mask;
-            first = pmd_offset(pudp, base_va);
-            phys = PFN_PHYS(pmd_pfn(*first)) + offset;
-        } else {
-            grp_size = pmd_leaf_size(*pmdp);
-            offset = virt & ~PMD_MASK;
-            phys = PFN_PHYS(pfn) | offset;
-        }
-
-        if (sz)
-            *sz = grp_size - offset;
-        return phys;
-    }
-
-    pte_t *ptep = pte_offset_kernel(pmdp, virt);
-    if (!pte_present(*ptep) || !pte_pfn(*ptep))
-        return ~0UL;
-
-    {
-        unsigned long pfn = pte_pfn(*ptep);
-        unsigned long offset;
-        unsigned long grp_size;
-        phys_addr_t phys;
-
-        if (pte_cont(*ptep)) {
-            unsigned long grp_mask = CONT_PTE_MASK;
-            unsigned long base_va;
-            pte_t *first;
-
-            grp_size = CONT_PTE_SIZE;
-            offset = virt & ~grp_mask;
-            base_va = virt & grp_mask;
-            first = pte_offset_kernel(pmdp, base_va);
-            phys = PFN_PHYS(pte_pfn(*first)) + offset;
-        } else {
-            grp_size = PAGE_SIZE;
-            offset = virt & ~PAGE_MASK;
-            phys = PFN_PHYS(pfn) | offset;
-        }
-
-        if (sz)
-            *sz = grp_size - offset;
-        return phys;
-    }
-}
-
-/* ---- nc_memrw + access_remote_vm_nc ---- */
-
-static ssize_t nc_memrw(struct mm_struct *mm, unsigned long addr, char __user *buf,
-                        size_t count, int write)
-{
-    ssize_t copied = 0;
-
-    while (count > 0) {
-        size_t this_len = size_inside_page(addr, count);
-        unsigned long phys = follow_phys_fast(mm, addr, &this_len);
-        unsigned long virt;
-        size_t failed_len;
-
-        if (phys == ~0UL)
-            break;
-
-        this_len = min(this_len, count);
-        virt = ____phys_to_virt_nc(phys);
-        if (!virt)
-            break;
-
-        if (!write) {
-            failed_len = copy_to_user(buf, (void *)virt, this_len);
-            if (failed_len) {
-                copied += this_len - failed_len;
-                break;
-            }
-        } else {
-            failed_len = copy_from_user((void *)virt, buf, this_len);
-            if (failed_len) {
-                copied += this_len - failed_len;
-                break;
-            }
-        }
-
-        buf += this_len;
-        addr += this_len;
-        copied += this_len;
-        count -= this_len;
-    }
-
-    return copied;
-}
-
-/* DminLine: CTR_EL0[19:16]，最小 D/统一 cache 行长(log2 字数)。
- * DC CVAC 一次只清包含该 VA 的那一条 line，by-VA 循环步长必须用最小行长，
- * 否则在 cache_line_size()(最大行长/CWG) > DminLine 的 SoC 上会跳过中间行漏刷。 */
-static inline unsigned long dcache_min_line(void)
-{
-    unsigned long ctr;
-    asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
-    return 4UL << ((ctr >> 16) & 0xf);
-}
-
-static ssize_t nc_memrw_cache(struct mm_struct *mm, unsigned long addr, char __user *buf,
-                              size_t count, int write)
-{
-    ssize_t copied = 0;
-
-    while (count > 0) {
-        size_t this_len = size_inside_page(addr, count);
-        unsigned long phys = follow_phys_fast(mm, addr, &this_len);
-        unsigned long virt;
-        size_t failed_len;
-
-        if (phys == ~0UL)
-            break;
-
-        this_len = min(this_len, count);
-        virt = ____phys_to_virt_nc(phys);
-        if (!virt)
-            break;
-
-        {
-            unsigned long line = dcache_min_line();
-            unsigned long c_va = (unsigned long)phys_to_virt(phys);
-            unsigned long s = c_va & ~(line - 1);
-            unsigned long e = (c_va + this_len + line - 1) & ~(line - 1);
-            unsigned long va;
-
-            for (va = s; va < e; va += line)
-                asm volatile("dc cvac, %0" : : "r"(va) : "memory");
-            asm volatile("dsb sy" : : : "memory");
-        }
-
-        if (!write) {
-            failed_len = copy_to_user(buf, (void *)virt, this_len);
-            if (failed_len) {
-                copied += this_len - failed_len;
-                break;
-            }
-        } else {
-            failed_len = copy_from_user((void *)virt, buf, this_len);
-            if (failed_len) {
-                copied += this_len - failed_len;
-                break;
-            }
-        }
-
-        buf += this_len;
-        addr += this_len;
-        copied += this_len;
-        count -= this_len;
-    }
-
-    return copied;
-}
-
-static ssize_t nc_memread_kernel(struct mm_struct *mm, unsigned long addr, char *buf,
-                                 size_t count)
-{
-    ssize_t copied = 0;
-
-    while (count > 0) {
-        size_t this_len = size_inside_page(addr, count);
-        unsigned long phys = follow_phys_fast(mm, addr, &this_len);
-        unsigned long virt;
-
-        if (phys == ~0UL)
-            break;
-
-        this_len = min(this_len, count);
-        virt = ____phys_to_virt_nc(phys);
-        if (!virt)
-            break;
-
-        memcpy(buf, (void *)virt, this_len);
-
-        buf += this_len;
-        addr += this_len;
-        copied += this_len;
-        count -= this_len;
-    }
-
-    return copied;
-}
-
-static ssize_t access_remote_vm_nc(pid_t vpid, unsigned long target, char __user *buffer,
-                                   size_t count, int write)
-{
-    ssize_t result = -ESRCH;
-    struct task_struct *task;
+    struct task_struct *task = mem_find_get_task(pid);
     struct mm_struct *mm;
-
-    task = mem_find_get_task(vpid);
-    if (!task)
-        return result;
-
+    long result;
+    if (!task) return -ESRCH;
     mm = get_task_mm(task);
-    if (!mm) {
-        put_task_struct(task);
-        return -EINVAL;
-    }
-
-    result = nc_memrw(mm, target, buffer, count, write);
-
-    mmput(mm);
     put_task_struct(task);
-    return result;
-}
-
-static ssize_t access_remote_vm_nc_cache(pid_t vpid, unsigned long target, char __user *buffer,
-                                         size_t count, int write)
-{
-    ssize_t result = -ESRCH;
-    struct task_struct *task;
-    struct mm_struct *mm;
-
-    task = mem_find_get_task(vpid);
-    if (!task)
-        return result;
-
-    mm = get_task_mm(task);
-    if (!mm) {
-        put_task_struct(task);
-        return -EINVAL;
-    }
-
-    result = nc_memrw_cache(mm, target, buffer, count, write);
-
+    if (!mm) return -ESRCH;
+    result = mem_copy_range(mm, address, (void *)buffer, count, true, clean);
     mmput(mm);
-    put_task_struct(task);
     return result;
 }
 
@@ -1428,13 +1131,8 @@ long mem_read_ctx_read(struct mem_read_ctx *ctx, uint64_t addr,
     if (size == 0 || size > (4 * 1024 * 1024))
         return -EINVAL;
 
-    ret = nc_memread_kernel(ctx->mm, (unsigned long)addr, buf, size);
-    if (ret < 0)
-        return ret;
-    if ((uint64_t)ret != size)
-        return -EFAULT;
-
-    return 0;
+    ret = mem_copy_range(ctx->mm, (unsigned long)addr, buf, size, false, false);
+    return ret;
 }
 
 void mem_read_ctx_release(struct mem_read_ctx *ctx)
@@ -1701,13 +1399,8 @@ long mem_read(void __user *arg)
     if (req.size == 0 || req.size > (4 * 1024 * 1024))
         return -EINVAL;
 
-    ret = access_remote_vm_nc(req.pid, req.addr, (char __user *)req.buf, req.size, 0);
-    if (ret < 0)
-        return ret;
-    if ((uint64_t)ret != req.size)
-        return -EFAULT;
-
-    return 0;
+    ret = access_remote_vm_read(req.pid, req.addr, (void __user *)req.buf, req.size, false);
+    return ret;
 }
 
 long mem_read_cache(void __user *arg)
@@ -1721,13 +1414,8 @@ long mem_read_cache(void __user *arg)
     if (req.size == 0 || req.size > (4 * 1024 * 1024))
         return -EINVAL;
 
-    ret = access_remote_vm_nc_cache(req.pid, req.addr, (char __user *)req.buf, req.size, 0);
-    if (ret < 0)
-        return ret;
-    if ((uint64_t)ret != req.size)
-        return -EFAULT;
-
-    return 0;
+    ret = access_remote_vm_read(req.pid, req.addr, (void __user *)req.buf, req.size, true);
+    return ret;
 }
 
 long mem_read_kernel(pid_t pid, uint64_t addr, void *buf, size_t size)
@@ -1758,6 +1446,7 @@ int mem_core_init(void)
         return -ENOENT;
 
     init_rwsem(&__linearmap_rwlock);
+    bp_backing_init();
 
     return create_linearmap();
 }

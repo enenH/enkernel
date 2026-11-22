@@ -92,6 +92,7 @@ jobs:
       - name: Build and install SDK
         run: |
           set -euo pipefail
+          python3 tests/run_memory_read_host.py
           c++ -std=c++17 -Wall -Wextra -Werror tests/process_mem_policy.cpp -o /tmp/dfm-policy-check
           /tmp/dfm-policy-check
           cmake -S . -B build/sdk -G Ninja \
@@ -102,6 +103,7 @@ jobs:
           cmake --build build/sdk --parallel "$(nproc)"
           cmake --install build/sdk --prefix "$PWD/out/enkernel-sdk-arm64-v8a"
           install -m 755 build/sdk/tests/dfm_fd_query_check out/enkernel-sdk-arm64-v8a/bin/
+          install -m 755 build/sdk/tests/dfm_memory_read_check out/enkernel-sdk-arm64-v8a/bin/
 
       - name: Verify installed SDK integration
         run: |
@@ -123,6 +125,8 @@ jobs:
 
   package:
     name: Package and publish release
+    # Development pushes validate modules but must not publish an untested release.
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     needs: [build, sdk]
     runs-on: ubuntu-latest
     timeout-minutes: 10

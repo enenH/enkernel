@@ -1,3 +1,6 @@
 add_executable(dfm_fd_query_check fd_query.cpp)
 target_link_libraries(dfm_fd_query_check PRIVATE enkernel::sdk)
 target_compile_options(dfm_fd_query_check PRIVATE -Wall -Wextra -Werror)
+add_executable(dfm_memory_read_check memory_read.cpp)
+target_link_libraries(dfm_memory_read_check PRIVATE enkernel::sdk)
+target_compile_options(dfm_memory_read_check PRIVATE -Wall -Wextra -Werror)
