@@ -6,6 +6,9 @@ ccflags-y += -Wno-unused-function -Wno-declaration-after-statement -Wno-gcc-comp
 
 # Inspect the selected kernel tree: vendors backport swap ABI changes.
 ifneq ($(wildcard $(srctree)/mm/swap_state.c),)
+ifneq ($(shell grep -El '^struct (page|folio) \*read_swap_cache_async' $(srctree)/mm/swap_state.c),)
+ccflags-y += -DDFM_SWAP_READER_KNOWN
+endif
 ifneq ($(shell grep -l '^struct folio \*read_swap_cache_async' $(srctree)/mm/swap_state.c),)
 ccflags-y += -DDFM_SWAP_READ_FOLIO
 endif

@@ -33,7 +33,9 @@ GUP-backed policy; this patch covers the ordinary NC read entry points. A mappin
 query still describes resident physical identity, not a synthesized swap PFN.
 
 Swap function signatures are selected from the actual build kernel tree rather
-than a version-only guess. Optional cache/slot/lock symbols are resolved as a
+than a version-only guess. An unrecognized or absent source declaration disables
+the optional swap path; CI checks that all shipped KMI builds actually enable it.
+Optional cache/slot/lock symbols are resolved as a
 complete set; unavailable helpers disable swap reads with EOPNOTSUPP while
 resident reads remain usable. Matching kernel/KMI modules are still required.
 
@@ -59,3 +61,8 @@ Local host checks and Android SDK/test builds passed. Six-KMI CI results and
 real-device results must be recorded separately; no device success is implied by
 compilation. Development-branch pushes now build without publishing a release;
 PR artifacts and main-branch releases retain their existing paths.
+
+On PLZ110, the previously loaded driver passed resident tests but returned
+EFAULT for the observed swapped-page fixture. Boot and system process identities
+remained unchanged. This reproduces the old failure; it is not a new-module
+success claim. The test does not unload the existing driver.

@@ -139,6 +139,7 @@ static unsigned long copy_to_user(void *dst, const void *src, size_t n)
 #define PTR_ERR(p) ((int)(intptr_t)(p))
 #define current NULL
 #define CONFIG_SWAP 1
+#define DFM_SWAP_READER_KNOWN 1
 #define SWAPPED 64u
 #define ERESTARTSYS 512
 typedef struct { unsigned long val; } swp_entry_t;

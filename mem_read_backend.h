@@ -10,7 +10,7 @@
  * docs/third-party/Qdrive-NOTICE.md. Included in mem.c after RAM alias setup.
  * Modifications: unified errno-preserving DFM reads and locked resident copies.
  */
-#ifdef CONFIG_SWAP
+#if defined(CONFIG_SWAP) && defined(DFM_SWAP_READER_KNOWN)
 struct swap_iocb;
 #ifdef DFM_SWAP_READ_FOLIO
 typedef struct folio *bp_bk_cache_result;
@@ -50,7 +50,7 @@ static unsigned long bp_bk_symbol(const char *name)
 
 static void bp_backing_init(void)
 {
-#ifdef CONFIG_SWAP
+#if defined(CONFIG_SWAP) && defined(DFM_SWAP_READER_KNOWN)
     bp_bk_cache_fn = (void *)bp_bk_symbol("read_swap_cache_async");
     bp_bk_duplicate_fn = (void *)bp_bk_symbol("swap_duplicate");
 #ifdef DFM_SWAP_FOLIO_LOCKS
@@ -73,7 +73,7 @@ static void bp_backing_init(void)
 #endif
 }
 
-#ifdef CONFIG_SWAP
+#if defined(CONFIG_SWAP) && defined(DFM_SWAP_READER_KNOWN)
 static __nocfi noinline int bp_bk_duplicate(swp_entry_t entry)
 {
     return bp_bk_duplicate_fn(entry);
@@ -166,7 +166,7 @@ static int bp_bk_pte(struct mm_struct *mm, unsigned long address, pte_t *out,
     *out = pte;
     if (!duplicate) { rc = 0; goto unlock; }
     if (pte_present(pte)) { rc = -EAGAIN; goto unlock; }
-#ifdef CONFIG_SWAP
+#if defined(CONFIG_SWAP) && defined(DFM_SWAP_READER_KNOWN)
     if (is_swap_pte(pte)) {
         swp_entry_t entry = pte_to_swp_entry(pte);
         if (non_swap_entry(entry)) { rc = -EOPNOTSUPP; goto unlock; }
@@ -192,7 +192,7 @@ out:
 static int bp_bk_swap_copy(struct mm_struct *mm, struct vm_area_struct *vma,
                        unsigned long address, void *buffer, size_t length)
 {
-#ifdef CONFIG_SWAP
+#if defined(CONFIG_SWAP) && defined(DFM_SWAP_READER_KNOWN)
     struct page *page, *head;
     swp_entry_t entry, base;
     pte_t original, check;

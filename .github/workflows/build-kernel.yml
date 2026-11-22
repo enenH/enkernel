@@ -47,6 +47,8 @@ jobs:
           set -euo pipefail
           make -j"$(nproc)" KDIR="${KERNEL_SRC:?KERNEL_SRC is not set}"
           test -s dfm.ko
+          # Fail if source-tree ABI detection silently disabled swap support.
+          grep -q -- '-DDFM_SWAP_READER_KNOWN' .mem.o.cmd
 
       - name: Verify CPU-clock implementation
         run: |
