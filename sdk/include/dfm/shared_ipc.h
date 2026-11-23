@@ -44,10 +44,19 @@ public:
     // Calls to close/setup/move must not race any operation. try_send returns
     // 0; try_receive returns the byte count. Empty/full returns -EAGAIN.
     // Messages are 1..max_payload bytes. EMSGSIZE leaves the message queued.
-    // There is no implicit wakeup, delivery acknowledgement or crash detection;
-    // integrate retries/liveness with the application's event loop.
+    // These calls never wait; publication wakes a peer in send/receive if
+    // needed. There is no delivery acknowledgement or crash detection.
     int try_send(const void* data, std::size_t size);
     int try_receive(void* data, std::size_t capacity);
+
+    // Wait variants: bounded spinning, then a shared-futex sleep/wake. The same
+    // SPSC/ownership/buffer rules apply. timeout_ns: 0 is nonblocking, -1 waits
+    // indefinitely, positive values bound waiting with CLOCK_MONOTONIC. Other
+    // negative values return EINVAL; expiry returns ETIMEDOUT. A peer exit does
+    // not wake these calls: use finite timeouts for liveness. Interrupted waits
+    // retry against the original deadline. No background thread is created.
+    int send(const void* data, std::size_t size, std::int64_t timeout_ns);
+    int receive(void* data, std::size_t capacity, std::int64_t timeout_ns);
 
     // Unmap this endpoint. Storage is reclaimed after the final mapping/fd is
     // released; a peer can retain its mapping. No process-global SDK close.
@@ -56,6 +65,7 @@ public:
 
 private:
     int check_owner() const;
+    int wait_ready(bool sending, std::int64_t timeout_ns);
     void* mapping_ = nullptr;
     std::size_t mapping_size_ = 0;
     int owner_pid_ = 0;

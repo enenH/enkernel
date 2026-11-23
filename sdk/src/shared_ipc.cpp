@@ -6,20 +6,30 @@
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
+#include <linux/futex.h>
 #include <linux/memfd.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 #include <utility>
 
+#ifndef SCM_PIDFD
+#define SCM_PIDFD 0x04
+#endif
+
 namespace {
 constexpr std::uint32_t magic = 0x44495043; // DIPC
-constexpr std::uint32_t version = 1;
+// Version 2 reserves a state bit for shared-futex waiters. Version 1 peers must
+// reject this layout rather than interpret a waiting mailbox as corruption.
+constexpr std::uint32_t version = 2;
 constexpr int required_seals = F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL;
 constexpr std::uint32_t empty = 0, full = 1;
+constexpr std::uint32_t waiting = 2;
+constexpr unsigned spin_count = 1024;
 
 // Lock-free native 32-bit atomics, shared between separate processes. All
 // offsets are compiled constants, never taken from peer-writable memory.
@@ -48,6 +58,23 @@ int privacy_policy() {
     const int state = prctl(PR_GET_DUMPABLE, 0, 0, 0, 0);
     if (state < 0) return -errno;
     return state == 0 ? 0 : -EPERM;
+}
+
+void cpu_relax() {
+#if defined(__aarch64__)
+    asm volatile("yield");
+#elif defined(__x86_64__) || defined(__i386__)
+    asm volatile("pause");
+#endif
+}
+
+void publish(Mailbox& slot, std::uint32_t state) {
+    // A waiter registers on this same word before FUTEX_WAIT_BITSET. Exchanging
+    // it prevents a concurrent registration from being lost between a load
+    // and store. Active polling needs no wake syscall.
+    const auto previous = __atomic_exchange_n(&slot.state, state, __ATOMIC_RELEASE);
+    if (previous & waiting)
+        syscall(__NR_futex, &slot.state, FUTEX_WAKE, 1, nullptr, nullptr, 0);
 }
 
 int peer_check(int socket, int expected_pid, std::uint32_t expected_uid) {
@@ -118,9 +145,11 @@ int receive_offer(int socket, std::size_t bytes, int& out_fd) {
     Offer offer{};
     iovec io{&offer, sizeof(offer)};
     // Room for unexpected rights, too: close every received descriptor on any
-    // protocol error. Linux closes rights truncated beyond this buffer.
+    // protocol error. Also leave room for automatically attached credentials
+    // and SCM_PIDFD. Linux closes descriptors truncated beyond this buffer.
     alignas(cmsghdr) unsigned char control[CMSG_SPACE(16 * sizeof(int)) +
-                                         CMSG_SPACE(sizeof(ucred))]{};
+                                         CMSG_SPACE(sizeof(ucred)) +
+                                         CMSG_SPACE(sizeof(int))]{};
     msghdr message{};
     message.msg_iov = &io;
     message.msg_iovlen = 1;
@@ -135,15 +164,19 @@ int receive_offer(int socket, std::size_t bytes, int& out_fd) {
     bool malformed = false;
     for (cmsghdr* header = CMSG_FIRSTHDR(&message); header;
          header = CMSG_NXTHDR(&message, header)) {
-        if (header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS)
+        if (header->cmsg_level != SOL_SOCKET ||
+            (header->cmsg_type != SCM_RIGHTS && header->cmsg_type != SCM_PIDFD))
             continue;
         if (header->cmsg_len < CMSG_LEN(0)) { malformed = true; break; }
         const std::size_t data_size = header->cmsg_len - CMSG_LEN(0);
-        if (data_size % sizeof(int)) malformed = true;
+        if (data_size % sizeof(int) ||
+            (header->cmsg_type == SCM_PIDFD && data_size != sizeof(int)))
+            malformed = true;
         for (std::size_t i = 0; i < data_size / sizeof(int); ++i) {
             int fd;
             std::memcpy(&fd, CMSG_DATA(header) + i * sizeof(int), sizeof(fd));
-            if (++count == 1) first.value = fd;
+            if (header->cmsg_type == SCM_PIDFD) ::close(fd);
+            else if (++count == 1) first.value = fd;
             else ::close(fd);
         }
     }
@@ -238,11 +271,11 @@ int SharedIpc::try_send(const void* data, std::size_t size) {
     if (size > max_payload) return -EMSGSIZE;
     auto& slot = static_cast<Region*>(mapping_)->slots[direction_];
     const auto state = __atomic_load_n(&slot.state, __ATOMIC_ACQUIRE);
-    if (state == full) return -EAGAIN;
-    if (state != empty) return -EPROTO;
+    if (state & ~(full | waiting)) return -EPROTO;
+    if (state & full) return -EAGAIN;
     std::memcpy(slot.payload, data, size);
     slot.length = static_cast<std::uint32_t>(size);
-    __atomic_store_n(&slot.state, full, __ATOMIC_RELEASE);
+    publish(slot, full);
     return 0;
 }
 
@@ -252,8 +285,8 @@ int SharedIpc::try_receive(void* data, std::size_t capacity) {
     if (!data || !capacity) return -EINVAL;
     auto& slot = static_cast<Region*>(mapping_)->slots[1 - direction_];
     const auto state = __atomic_load_n(&slot.state, __ATOMIC_ACQUIRE);
-    if (state == empty) return -EAGAIN;
-    if (state != full) return -EPROTO;
+    if (state & ~(full | waiting)) return -EPROTO;
+    if (!(state & full)) return -EAGAIN;
     const auto length = slot.length;
     if (!length || length > max_payload) return -EPROTO;
     if (length > capacity) return -EMSGSIZE;
@@ -261,8 +294,61 @@ int SharedIpc::try_receive(void* data, std::size_t capacity) {
     // Clear consumed content before publishing the slot as reusable.
     std::memset(slot.payload, 0, length);
     slot.length = 0;
-    __atomic_store_n(&slot.state, empty, __ATOMIC_RELEASE);
+    publish(slot, empty);
     return static_cast<int>(length);
+}
+
+int SharedIpc::wait_ready(bool sending, std::int64_t timeout_ns) {
+    timespec deadline{};
+    if (timeout_ns >= 0) {
+        if (clock_gettime(CLOCK_MONOTONIC, &deadline)) return -errno;
+        deadline.tv_sec += timeout_ns / 1000000000;
+        deadline.tv_nsec += timeout_ns % 1000000000;
+        if (deadline.tv_nsec >= 1000000000) {
+            ++deadline.tv_sec;
+            deadline.tv_nsec -= 1000000000;
+        }
+    }
+    auto& slot = static_cast<Region*>(mapping_)->slots[sending ? direction_ : 1 - direction_];
+    const auto blocked = sending ? full : empty;
+    unsigned spins = 0;
+    for (;;) {
+        auto state = __atomic_load_n(&slot.state, __ATOMIC_ACQUIRE);
+        if (state & ~(full | waiting)) return -EPROTO;
+        if ((state & full) != blocked) return 0;
+        if (spins++ < spin_count) { cpu_relax(); continue; }
+        const int policy = check_owner();
+        if (policy) return policy;
+        if (!(state & waiting) &&
+            !__atomic_compare_exchange_n(&slot.state, &state, state | waiting,
+                                         false, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            continue;
+        // Shared futex (never FUTEX_PRIVATE_FLAG), with an absolute monotonic
+        // deadline so signals/spurious wakes do not extend the timeout.
+        const long result = syscall(__NR_futex, &slot.state, FUTEX_WAIT_BITSET,
+                                    blocked | waiting, timeout_ns < 0 ? nullptr : &deadline,
+                                    nullptr, FUTEX_BITSET_MATCH_ANY);
+        if (result < 0 && errno != EAGAIN && errno != EINTR) return -errno;
+        // Leave a timed-out wait bit for publish() to clear. Clearing it here
+        // could erase the opposite endpoint's newly registered wait.
+        spins = 0;
+    }
+}
+
+int SharedIpc::send(const void* data, std::size_t size, std::int64_t timeout_ns) {
+    if (timeout_ns < -1) return -EINVAL;
+    const int result = try_send(data, size);
+    if (result != -EAGAIN || timeout_ns == 0) return result;
+    const int ready = wait_ready(true, timeout_ns);
+    return ready ? ready : try_send(data, size);
+}
+
+int SharedIpc::receive(void* data, std::size_t capacity, std::int64_t timeout_ns) {
+    if (timeout_ns < -1) return -EINVAL;
+    const int result = try_receive(data, capacity);
+    if (result != -EAGAIN || timeout_ns == 0) return result;
+    const int ready = wait_ready(false, timeout_ns);
+    return ready ? ready : try_receive(data, capacity);
 }
 
 void SharedIpc::close() noexcept {

@@ -34,7 +34,8 @@ undetectable, even to unprivileged observers.
 - Only one memfd descriptor is accepted, via SCM_RIGHTS with MSG_CMSG_CLOEXEC.
   Permanently sealed size, exact page-rounded length, writable access, envelope
   version and ancillary truncation are validated before mapping. Every received
-  descriptor is closed on rejection.
+  descriptor is closed on rejection. Automatically attached SCM_PIDFD handles
+  are closed on both success and failure; they are never treated as the memfd.
 - Shared mappings require MADV_DONTDUMP and MADV_DONTFORK; failure aborts setup.
   No backing fd remains in either SDK object after setup. Do not race
   initialization with fork: temporary descriptors, including a pending socket
@@ -90,12 +91,33 @@ publication prevents a receiver from observing a partial cooperative message.
 Oversized input returns -EMSGSIZE; an undersized receive buffer leaves the
 message queued. Consumed bytes are cleared before the slot becomes reusable.
 
-An empty receive or full send returns -EAGAIN. Schedule retries with the
-application's event loop, deadline and cancellation policy; there is no hidden
-polling thread, futex wakeup or per-message socket notification. A peer's exit
-does not automatically produce EOF. If that behavior is needed, retain a
-separate authenticated liveness connection. Successful send means published,
-not acknowledged by the peer. Setup/move/close must not race channel operations.
+An empty receive or full send returns -EAGAIN. Applications with an existing
+event loop can continue using try_send/try_receive. For waiting calls, use:
+
+    // Up to 5 milliseconds; send returns 0, receive returns the byte count.
+    int sent = channel.send(data, size, 5000000);
+    int received = channel.receive(buffer, capacity, 5000000);
+
+send/receive keep the same SPSC, buffer, privacy and ownership rules. A zero
+timeout is nonblocking (-EAGAIN), -1 waits indefinitely, and positive values
+specify nanoseconds measured against CLOCK_MONOTONIC. Other negative values
+return -EINVAL. Deadline expiry returns -ETIMEDOUT without consuming a message
+or changing the payload. Interrupted waits retry against the original deadline.
+There is no delivery acknowledgement or peer-crash detection: use finite
+timeouts and a separate authenticated liveness connection when needed.
+
+The waiting path spins for at most 1024 state probes, then registers a wait bit
+in the mailbox's atomic state word and sleeps on a shared FUTEX_WAIT_BITSET.
+Publication uses a release exchange and FUTEX_WAKE only when a wait bit was
+present. A concurrent state change either wakes the sleeper or causes the
+kernel's value check to reject the sleep, avoiding a lost wakeup. No worker,
+timer polling or per-message socket record is added. Waiting syscalls remain
+subject to normal kernel/security visibility and policy. Existing per-operation
+dumpable checks, content clearing and acquire/release publication remain active.
+
+The wire version is now 2 because version 1 did not understand the wait bit.
+Update both endpoints together; mixed versions are rejected with -EPROTO during
+setup. Setup/move/close must not race any channel operation, including waits.
 
 Objects are movable, not copyable. close()/destruction unmaps that endpoint;
 the memfd storage is reclaimed after all mappings and any pending descriptor
@@ -117,8 +139,31 @@ module. Tests establish sockets after fork and cover:
 - Third-party same-UID denial of target maps, memory, fd enumeration and
   process_vm_readv, plus actual MADV_DONTFORK behavior.
 - Unsealed/wrong-size/read-only descriptors, extra/truncated/missing rights,
-  wrong versions, oversized records, corrupted state/length and closed peers.
+  wrong/legacy versions, oversized records, corrupted state/length and closed peers.
   Rejected offers must not leak descriptors or leave an open channel.
+- SO_PASSPIDFD plus SO_PASSCRED, when supported, on both successful and rejected
+  offers; fd counts must remain unchanged. Unsupported kernels report a skip.
+- Futex handoff in both directions, mixed waiting/nonblocking operations,
+  timeout/retry, signal interruption, insufficient buffers and owner/policy checks.
+
+The Android build also produces dfm_shared_ipc_latency. Run as an ordinary user:
+
+    ./dfm_shared_ipc_latency poll 64 2000
+    ./dfm_shared_ipc_latency busy 64 10000
+    ./dfm_shared_ipc_latency wait 64 10000
+    ./dfm_shared_ipc_latency wait 4096 10000
+    ./dfm_shared_ipc_latency wait 64 2000 1000
+
+Modes compare 1 ms sleep polling, continuous polling and the waiting API. The
+optional last argument delays the echo process by that many microseconds per
+exchange, allowing CPU-time comparisons for sparse traffic. Output reports
+round-trip p50/p95/p99/mean in microseconds and parent process CPU time. It
+validates every echoed payload and excludes 64 warmup exchanges from latency
+samples (CPU time includes warmup). No CPU affinity or scheduler policy is
+changed. Results depend on scheduling, load and CPU placement; the waiting API
+avoids continuous idle polling, while continuous polling can still be faster.
+See [shared-ipc-validation.md](shared-ipc-validation.md) for the measured baseline,
+device results and local validation scope.
 
 These checks validate this permission boundary on the tested platform, not
 undetectability, different Android SELinux domains or privileged-adversary

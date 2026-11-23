@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <initializer_list>
 #include <linux/memfd.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
@@ -18,8 +19,13 @@
 #include <sys/syscall.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 #include <utility>
+
+#ifndef SO_PASSPIDFD
+#define SO_PASSPIDFD 76
+#endif
 
 #define CHECK(test) do { if (!(test)) { \
     std::fprintf(stderr, "FAIL pid=%d line=%d: %s (errno=%d)\n", \
@@ -124,6 +130,8 @@ void observer_check(dfm::SharedIpc& channel) {
         char data[16]{};
         CHECK(channel.try_send(data, sizeof(data)) == -EPERM);
         CHECK(channel.try_receive(data, sizeof(data)) == -EPERM);
+        CHECK(channel.send(data, sizeof(data), 1000000) == -EPERM);
+        CHECK(channel.receive(data, sizeof(data), 1000000) == -EPERM);
         char path[128];
         for (const char* entry : {"maps", "mem"}) {
             std::snprintf(path, sizeof(path), "/proc/%d/%s", parent, entry);
@@ -143,7 +151,25 @@ void observer_check(dfm::SharedIpc& channel) {
     join(observer);
 }
 
-void round_trip() {
+void enable_pidfd(int fd) {
+    const int enabled = 1;
+    CHECK(setsockopt(fd, SOL_SOCKET, SO_PASSPIDFD, &enabled, sizeof(enabled)) == 0);
+    CHECK(setsockopt(fd, SOL_SOCKET, SO_PASSCRED, &enabled, sizeof(enabled)) == 0);
+}
+
+bool supports_pidfd() {
+    const int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    CHECK(fd >= 0);
+    const int enabled = 1;
+    const int result = setsockopt(fd, SOL_SOCKET, SO_PASSPIDFD, &enabled, sizeof(enabled));
+    const int error = errno;
+    ::close(fd);
+    if (result == 0) return true;
+    CHECK(error == ENOPROTOOPT || error == EINVAL);
+    return false;
+}
+
+void round_trip(bool pidfd = false) {
     auto peer = connect_peer();
     const int before = fd_count();
     dfm::SharedIpc channel;
@@ -153,6 +179,7 @@ void round_trip() {
     for (size_t i = 0; i < sizeof(payload); ++i)
         payload[i] = static_cast<unsigned char>(i * 37);
     if (peer.child) {
+        if (pidfd) enable_pidfd(peer.fd);
         CHECK(channel.accept(peer.fd, peer.pid, getuid()) == -EAGAIN);
         put(peer.fd, 'p');
         CHECK(retry([&] { return channel.accept(peer.fd, peer.pid, getuid()); }) == 0);
@@ -223,10 +250,88 @@ void wrong_socketpair() {
     join(child);
 }
 
-enum BadOffer { Unsealed, WrongSize, ExtraRights, TruncatedRights, WrongVersion,
-                OversizeRecord, MissingRights, ReadOnly, BadLength, BadState, Closed };
+void interrupted(int) {}
 
-void bad_offer(BadOffer kind) {
+void waiting_transfer() {
+    auto peer = connect_peer();
+    dfm::SharedIpc channel;
+    char data[16]{};
+    constexpr std::int64_t second = 1000000000;
+    if (peer.child) {
+        CHECK(retry([&] { return channel.accept(peer.fd, peer.pid, getuid()); }) == 0);
+        put(peer.fd, 'r');
+        get(peer.fd, 's');
+        // Force the parent into a real futex sleep. An interrupted wait must
+        // retry against the original deadline and still deliver exactly once.
+        usleep(10000);
+        CHECK(kill(peer.pid, SIGUSR1) == 0);
+        usleep(10000);
+        CHECK(channel.send("wake", 4, second) == 0);
+        get(peer.fd, 'f');
+        usleep(10000);
+        CHECK(channel.receive(data, sizeof(data), second) == 5);
+        CHECK(std::memcmp(data, "first", 5) == 0);
+        CHECK(channel.receive(data, sizeof(data), second) == 6);
+        CHECK(std::memcmp(data, "second", 6) == 0);
+        put(peer.fd, 'd');
+    } else {
+        CHECK(channel.offer(peer.fd, peer.pid, getuid()) == 0);
+        get(peer.fd, 'r');
+        CHECK(channel.receive(data, sizeof(data), -2) == -EINVAL);
+        CHECK(channel.send("x", 1, -2) == -EINVAL);
+        CHECK(channel.receive(data, sizeof(data), 0) == -EAGAIN);
+        timespec start{}, end{};
+        CHECK(clock_gettime(CLOCK_MONOTONIC, &start) == 0);
+        CHECK(channel.receive(data, sizeof(data), 2000000) == -ETIMEDOUT);
+        CHECK(clock_gettime(CLOCK_MONOTONIC, &end) == 0);
+        const auto elapsed = (end.tv_sec - start.tv_sec) * second + end.tv_nsec - start.tv_nsec;
+        CHECK(elapsed >= 2000000);
+        struct sigaction action{};
+        action.sa_handler = interrupted;
+        CHECK(sigemptyset(&action.sa_mask) == 0);
+        CHECK(sigaction(SIGUSR1, &action, nullptr) == 0);
+        put(peer.fd, 's');
+        CHECK(channel.receive(data, sizeof(data), second) == 4);
+        CHECK(std::memcmp(data, "wake", 4) == 0);
+        CHECK(channel.send("first", 5, 0) == 0);
+        CHECK(channel.send("second", 6, 0) == -EAGAIN);
+        CHECK(channel.send("second", 6, 2000000) == -ETIMEDOUT);
+        put(peer.fd, 'f');
+        CHECK(channel.send("second", 6, second) == 0);
+        get(peer.fd, 'd');
+    }
+    // Repeated handoff checks both wake directions and mixes blocking and
+    // nonblocking endpoints on the same version-2 mapping.
+    for (std::uint32_t sequence = 0; sequence < 1000; ++sequence) {
+        std::uint32_t reply = 0;
+        if (peer.child) {
+            CHECK(channel.receive(&reply, sizeof(reply), second) == sizeof(reply));
+            CHECK(reply == sequence);
+            CHECK(retry([&] { return channel.try_send(&reply, sizeof(reply)); }) == 0);
+        } else {
+            CHECK(channel.send(&sequence, sizeof(sequence), second) == 0);
+            CHECK(channel.receive(&reply, 1, second) == -EMSGSIZE);
+            CHECK(channel.receive(&reply, sizeof(reply), -1) == sizeof(reply));
+            CHECK(reply == sequence);
+        }
+    }
+    CHECK(prctl(PR_SET_DUMPABLE, 1, 0, 0, 0) == 0);
+    CHECK(channel.send(data, sizeof(data), second) == -EPERM);
+    CHECK(channel.receive(data, sizeof(data), second) == -EPERM);
+    CHECK(prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) == 0);
+    channel.close();
+    CHECK(channel.send(data, sizeof(data), second) == -ENOTCONN);
+    CHECK(channel.receive(data, sizeof(data), second) == -ENOTCONN);
+    ::close(peer.fd);
+    if (peer.child) std::exit(0);
+    join(peer.pid);
+}
+
+enum BadOffer { Unsealed, WrongSize, ExtraRights, TruncatedRights, WrongVersion,
+                OversizeRecord, MissingRights, ReadOnly, BadLength, BadState, Closed,
+                LegacyVersion };
+
+void bad_offer(BadOffer kind, bool pidfd = false) {
     auto peer = connect_peer();
     const long page = sysconf(_SC_PAGESIZE);
     // The wire envelope carries the local page-rounded region size. Obtain it
@@ -254,6 +359,9 @@ void bad_offer(BadOffer kind) {
         ::close(original);
         // Return the actual envelope for mutation by the sending test peer.
         CHECK(send(peer.fd, envelope, 4 * sizeof(std::uint32_t), MSG_NOSIGNAL) == 4 * sizeof(std::uint32_t));
+        // Enable before the parent queues its offer, including on older kernels
+        // that capture ancillary credentials at send time.
+        if (pidfd) enable_pidfd(peer.fd);
         put(peer.fd, 'r');
         const int before = fd_count();
         dfm::SharedIpc receiver;
@@ -294,6 +402,7 @@ void bad_offer(BadOffer kind) {
             backing = readonly;
         }
         if (kind == WrongVersion) ++envelope[1];
+        if (kind == LegacyVersion) envelope[1] = 1;
         const size_t count = kind == ExtraRights ? 2 : kind == TruncatedRights ? 64 : 1;
         alignas(cmsghdr) unsigned char control[CMSG_SPACE(64 * sizeof(int))]{};
         iovec io{envelope, (kind == OversizeRecord ? 5U : 4U) * sizeof(std::uint32_t)};
@@ -333,8 +442,18 @@ int main() {
     ::close(stream);
     wrong_socketpair();
     round_trip();
+    waiting_transfer();
     for (BadOffer kind : {Unsealed, WrongSize, ExtraRights, TruncatedRights,
                           WrongVersion, OversizeRecord, MissingRights, ReadOnly,
-                          BadLength, BadState, Closed}) bad_offer(kind);
-    std::puts("DFM_SHARED_IPC_PASS: credentials, duplex, bounds, backpressure, move, cleanup, fork, malformed offers and unprivileged observer isolation");
+                          BadLength, BadState, Closed, LegacyVersion}) bad_offer(kind);
+    if (supports_pidfd()) {
+        round_trip(true);
+        for (BadOffer kind : {Unsealed, WrongSize, ExtraRights, TruncatedRights,
+                              WrongVersion, OversizeRecord, MissingRights, ReadOnly,
+                              BadLength, BadState, Closed, LegacyVersion}) bad_offer(kind, true);
+        std::puts("DFM_SHARED_IPC_PIDFD_PASS: success and rejection paths retain no descriptors");
+    } else {
+        std::puts("DFM_SHARED_IPC_PIDFD_SKIP: SO_PASSPIDFD unsupported");
+    }
+    std::puts("DFM_SHARED_IPC_PASS: credentials, duplex, bounds, backpressure, wait/wake, deadlines, signals, move, cleanup, fork, malformed offers and unprivileged observer isolation");
 }
