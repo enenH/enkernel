@@ -83,13 +83,19 @@ struct dfm_capabilities_req {
  * grants access, as for KGSL_QUERY. One file reference pins the lookup for each
  * request; calls are not a cross-call snapshot and fd numbers can be reused.
  * No local fd is installed, no pathname is supplied, and target f_pos is never
- * changed (not even temporarily). Filesystem access/atime effects may occur.
+ * changed (not even temporarily). The target file is never reopened. Reads
+ * use its open flags/private state; filesystem access/atime effects may
+ * occur. File-operation errors are not retried through a pathname.
  *
  * INFO: offset/whence/buf/size must be zero.
  * PREAD: offset >= 0, size 1..MAX_READ, whence zero. Short reads/EOF succeed.
- * SEEK: offset is signed; whence uses Linux SEEK_SET/CUR/END/DATA/HOLE (0..4).
- *       CUR is relative to the sampled target position, not a prior query.
- *       DATA/HOLE use the filesystem's implementation, never an approximation.
+ * SEEK: compute a virtual offset for Linux SEEK_SET/CUR/END (0..2), bounded
+ *       by zero and the filesystem's s_maxbytes. CUR/END use sampled target
+ *       position/size, not a prior query. No filesystem llseek callback runs;
+ *       filesystem-private seek rules are not emulated. DATA/HOLE (3..4)
+ *       return EOPNOTSUPP without inspecting extents or reading data.
+ * PREAD/SEEK require FMODE_PREAD/FMODE_LSEEK respectively (otherwise ESPIPE);
+ * write-only/O_PATH descriptors return EBADF for either operation.
  * All flags/reserved/unused inputs must be zero. Outputs are cleared per call.
  * ioctl < 0: malformed request, transport, task lookup or allocation failure.
  * ioctl == 0: inspect positive out_errno for a file-operation error; outputs

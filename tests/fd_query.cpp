@@ -46,19 +46,22 @@ int main() {
         "kernel rejects reserved fields without SDK validation");
     struct stat metadata{}; require(fstat(fd,&metadata)==0 && req.out_inode==metadata.st_ino &&
         S_ISREG(req.out_mode), "file identity");
-    for (int whence:{SEEK_SET,SEEK_CUR,SEEK_END,SEEK_DATA,SEEK_HOLE}) {
+    for (int whence:{SEEK_SET,SEEK_CUR,SEEK_END}) {
         req=request(getpid(),fd,DFM_FILE_QUERY_SEEK); req.whence=whence;
         const auto expected=lseek(reference,whence==SEEK_CUR?123:0,whence==SEEK_CUR?SEEK_SET:whence);
         const int error=expected<0?errno:0;
         require(dfm::query_file(req)==0 && req.out_errno==error &&
-            (error || req.out_result==expected), "seek matches native filesystem");
+            (error || req.out_result==expected), "virtual seek matches ordinary file offset");
         require(lseek(fd,0,SEEK_CUR)==123, "seek never changes target offset");
     }
     req=request(getpid(),fd,DFM_FILE_QUERY_SEEK); req.whence=SEEK_CUR; req.offset=-124;
     require(dfm::query_file(req)==0 && req.out_errno==EINVAL, "negative seek result");
     req.offset=INT64_MAX; require(dfm::query_file(req)==0 && req.out_errno==EOVERFLOW, "CUR overflow");
-    req.whence=SEEK_DATA; req.offset=16387;
-    require(dfm::query_file(req)==0 && req.out_errno==ENXIO, "DATA at EOF");
+    for (int whence:{SEEK_DATA,SEEK_HOLE}) {
+        req=request(getpid(),fd,DFM_FILE_QUERY_SEEK); req.whence=whence;
+        require(dfm::query_file(req)==0 && req.out_errno==EOPNOTSUPP && req.out_inode==0,
+            "extent seeks are explicitly unsupported");
+    }
     char bytes[8]; std::memset(bytes,0x55,sizeof(bytes));
     req=request(getpid(),fd,DFM_FILE_QUERY_PREAD); req.buf=reinterpret_cast<uint64_t>(bytes); req.size=8; req.offset=16384;
     success(req); require(req.out_size==3 && std::memcmp(bytes,"xyz",3)==0 && bytes[3]==0x55, "short read");
@@ -103,6 +106,15 @@ int main() {
     require(req.out_position==123 && std::memcmp(bytes,"abc",3)==0, "remote PID/FD read");
     close(channel[1]); int child_status=0; require(waitpid(child,&child_status,0)==child, "child exit");
     req=request(child,fd,DFM_FILE_QUERY_INFO); require(dfm::query_file(req)==-ESRCH, "exited target");
+    require(unlink(path)==0, "unlink pinned file");
+    const int replacement=open(path,O_CREAT|O_EXCL|O_WRONLY|O_CLOEXEC,0600);
+    require(replacement>=0 && write(replacement,"new",3)==3, "replacement pathname");
+    close(replacement);
+    req=request(getpid(),fd,DFM_FILE_QUERY_PREAD);
+    req.buf=reinterpret_cast<uint64_t>(bytes); req.size=3; success(req);
+    require(req.out_inode==metadata.st_ino && std::memcmp(bytes,"abc",3)==0,
+        "query retains unlinked descriptor identity");
+    require(lseek(fd,0,SEEK_CUR)==123, "unlinked read preserves target offset");
     close(reference);
-    std::puts("PASS: target fd metadata, native seek semantics, pread/EOF, bounds, descriptor types, concurrency and process exit");
+    std::puts("PASS: target fd metadata, virtual seek, pread/EOF, bounds, descriptor identity, concurrency and process exit");
 }

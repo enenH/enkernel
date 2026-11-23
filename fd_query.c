@@ -92,10 +92,44 @@ static void clear_output(struct dfm_file_query_req *req)
     req->out_mode = req->out_errno = 0;
 }
 
+/* A query computes a virtual cursor; it must never call ->llseek(), which can
+ * change f_pos or filesystem-private state even if f_pos is later restored. */
+static loff_t query_seek(struct file *target,
+                        const struct dfm_file_query_req *req)
+{
+    loff_t base = 0, pos;
+
+    if (!(target->f_mode & FMODE_LSEEK))
+        return -ESPIPE;
+    switch (req->whence) {
+    case SEEK_SET:
+        break;
+    case SEEK_CUR:
+        if (req->out_position > LLONG_MAX)
+            return -EOVERFLOW;
+        base = req->out_position;
+        break;
+    case SEEK_END:
+        if (req->out_file_size > LLONG_MAX)
+            return -EOVERFLOW;
+        base = req->out_file_size;
+        break;
+    default:
+        /* DATA/HOLE require filesystem-specific callbacks. Do not reopen the
+         * file, clone struct file, or approximate sparse extent information. */
+        return -EOPNOTSUPP;
+    }
+    if (check_add_overflow(base, req->offset, &pos))
+        return -EOVERFLOW;
+    if (pos < 0 || pos > file_inode(target)->i_sb->s_maxbytes)
+        return -EINVAL;
+    return pos;
+}
+
 long dfm_file_query_fd(void __user *arg)
 {
     struct dfm_file_query_req req;
-    struct file *target, *reader = NULL;
+    struct file *target;
     struct inode *inode;
     const struct cred *saved;
     void *buffer = NULL;
@@ -138,50 +172,33 @@ long dfm_file_query_fd(void __user *arg)
     if (req.op == DFM_FILE_QUERY_INFO)
         goto out_target;
     if (req.op == DFM_FILE_QUERY_PREAD) {
+        if (!(target->f_mode & FMODE_PREAD)) {
+            req.out_errno = ESPIPE;
+            goto out_target;
+        }
         buffer = kvmalloc(req.size, GFP_KERNEL);
         if (!buffer) {
             ret = -ENOMEM;
             goto out_target;
         }
-    }
-    /* Pin the same inode/path but use an independent open file description.
-     * Never seek-and-restore the target: dup/fork peers could observe the change.
-     * Use its opening credentials; normal VFS/LSM checks still apply. */
-    saved = override_creds(target->f_cred);
-    reader = dentry_open(&target->f_path, O_RDONLY | O_LARGEFILE, target->f_cred);
-    if (IS_ERR(reader)) {
-        req.out_errno = -PTR_ERR(reader);
-        reader = NULL;
-        goto revert;
-    }
-    if (req.op == DFM_FILE_QUERY_PREAD) {
+        /* Read the pinned open description itself, preserving its flags and
+         * private state. A private position never changes the target cursor.
+         * Keep the opening credentials and normal VFS/LSM read checks. */
+        saved = override_creds(target->f_cred);
         pos = req.offset;
-        count = kernel_read(reader, buffer, req.size, &pos);
+        count = kernel_read(target, buffer, req.size, &pos);
+        revert_creds(saved);
         if (count < 0)
             req.out_errno = -count;
         else
             req.out_size = count;
     } else {
-        pos = req.offset;
-        if (req.whence == SEEK_CUR) {
-            if (req.out_position > LLONG_MAX ||
-                check_add_overflow((loff_t)req.out_position, pos, &pos)) {
-                req.out_errno = EOVERFLOW;
-                goto revert;
-            }
-            pos = vfs_llseek(reader, pos, SEEK_SET);
-        } else {
-            pos = vfs_llseek(reader, pos, req.whence);
-        }
+        pos = query_seek(target, &req);
         if (pos < 0)
             req.out_errno = -pos;
         else
             req.out_result = pos;
     }
-revert:
-    if (reader)
-        fput(reader);
-    revert_creds(saved);
     if (!req.out_errno && req.out_size &&
         copy_to_user(u64_to_user_ptr(req.buf), buffer, req.out_size))
         ret = -EFAULT;

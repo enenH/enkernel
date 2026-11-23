@@ -73,8 +73,9 @@ namespace dfm {
     long query_kgsl(dfm_kgsl_query_req& request);
 
     /* Regular-file INFO/PREAD/SEEK through an existing target PID/FD. No local
-     * target fd, path proxy, process mutation or userspace fallback. The kernel
-     * pins one file per request and never changes its offset. Return 0 requires
+     * target fd, reopen, path proxy, process mutation or userspace fallback. The
+     * kernel pins one file per request and never changes its offset. SEEK only
+     * computes SET/CUR/END offsets; DATA/HOLE report EOPNOTSUPP. Return 0 requires
      * checking positive out_errno; negative returns are infrastructure errors.
      * See dfm_file_query_req for bounds, concurrency and SEEK_CUR semantics. */
     long query_file(dfm_file_query_req& request);
