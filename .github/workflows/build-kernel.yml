@@ -97,6 +97,7 @@ jobs:
           python3 tests/run_fd_query_host.py
           python3 tests/run_memory_read_host.py
           python3 tests/run_swap_reader_abi_host.py
+          python3 tests/run_shared_ipc_host.py
           c++ -std=c++17 -Wall -Wextra -Werror tests/process_mem_policy.cpp -o /tmp/dfm-policy-check
           /tmp/dfm-policy-check
           cmake -S . -B build/sdk -G Ninja \
@@ -108,6 +109,7 @@ jobs:
           cmake --install build/sdk --prefix "$PWD/out/enkernel-sdk-arm64-v8a"
           install -m 755 build/sdk/tests/dfm_fd_query_check out/enkernel-sdk-arm64-v8a/bin/
           install -m 755 build/sdk/tests/dfm_memory_read_check out/enkernel-sdk-arm64-v8a/bin/
+          install -m 755 build/sdk/tests/dfm_shared_ipc_check out/enkernel-sdk-arm64-v8a/bin/
 
       - name: Verify installed SDK integration
         run: |
