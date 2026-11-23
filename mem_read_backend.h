@@ -11,19 +11,24 @@
  * Modifications: unified errno-preserving DFM reads and locked resident copies.
  */
 #if defined(CONFIG_SWAP) && defined(DFM_SWAP_READER_KNOWN)
+#if !defined(DFM_SWAP_READ_POLL) && !defined(DFM_SWAP_READ_PLUG)
+#error "Detected swap reader requires an explicit poll/plug ABI"
+#endif
 struct swap_iocb;
 #ifdef DFM_SWAP_READ_FOLIO
 typedef struct folio *bp_bk_cache_result;
 #else
 typedef struct page *bp_bk_cache_result;
 #endif
-#ifdef DFM_SWAP_READ_PLUG
 static bp_bk_cache_result (*bp_bk_cache_fn)(swp_entry_t, gfp_t,
-                    struct vm_area_struct *, unsigned long, struct swap_iocb **);
-#else
-static bp_bk_cache_result (*bp_bk_cache_fn)(swp_entry_t, gfp_t,
-                    struct vm_area_struct *, unsigned long, bool);
+                    struct vm_area_struct *, unsigned long
+#ifdef DFM_SWAP_READ_POLL
+                    , bool
 #endif
+#ifdef DFM_SWAP_READ_PLUG
+                    , struct swap_iocb **
+#endif
+                    );
 static typeof(&swap_duplicate) bp_bk_duplicate_fn;
 #ifdef DFM_SWAP_FOLIO_LOCKS
 static typeof(&__folio_lock_killable) bp_bk_lock_fn;
@@ -70,6 +75,10 @@ static void bp_backing_init(void)
         pr_warn("dfm: swap backing unavailable cache=%d duplicate=%d free=%d lock=%d unlock=%d\n",
                 !!bp_bk_cache_fn, !!bp_bk_duplicate_fn, !!bp_bk_free_fn,
                 !!bp_bk_lock_fn, !!bp_bk_unlock_fn);
+#elif !defined(CONFIG_SWAP)
+    pr_warn("dfm: swap backing unavailable: CONFIG_SWAP is disabled\n");
+#else
+    pr_warn("dfm: swap backing unavailable: reader ABI was not recognized at build time\n");
 #endif
 }
 
@@ -92,11 +101,14 @@ static __nocfi noinline struct page *bp_bk_read_cache(swp_entry_t entry,
                          struct vm_area_struct *vma, unsigned long address)
 {
     bp_bk_cache_result result;
-#ifdef DFM_SWAP_READ_PLUG
-    result = bp_bk_cache_fn(entry, GFP_HIGHUSER_MOVABLE, vma, address, NULL);
-#else
-    result = bp_bk_cache_fn(entry, GFP_HIGHUSER_MOVABLE, vma, address, false);
+    result = bp_bk_cache_fn(entry, GFP_HIGHUSER_MOVABLE, vma, address
+#ifdef DFM_SWAP_READ_POLL
+                          , false
 #endif
+#ifdef DFM_SWAP_READ_PLUG
+                          , NULL
+#endif
+                          );
     if (!result || IS_ERR(result)) return (struct page *)result;
 #ifdef DFM_SWAP_READ_FOLIO
     return &result->page;

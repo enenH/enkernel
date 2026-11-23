@@ -35,6 +35,11 @@ query still describes resident physical identity, not a synthesized swap PFN.
 Swap function signatures are selected from the actual build kernel tree rather
 than a version-only guess. An unrecognized or absent source declaration disables
 the optional swap path; CI checks that all shipped KMI builds actually enable it.
+The detector reads the complete `read_swap_cache_async` signature, including
+the transitional Android six-argument ABI (`bool do_poll, struct swap_iocb **`).
+The presence of `swap_iocb` elsewhere in the kernel does not identify this ABI.
+Page/folio return types and poll/plug arguments are selected independently; an
+unknown argument list disables the reader instead of making an unsafe call.
 Optional cache/slot/lock symbols are resolved as a
 complete set; unavailable helpers disable swap reads with EOPNOTSUPP while
 resident reads remain usable. Matching kernel/KMI modules are still required.
@@ -48,6 +53,10 @@ PROT_NONE, contiguous PFNs, detached PTE tables, alias teardown, mixed swap/RAM,
 compound offsets, interrupted lock waits, unavailable callbacks, stale PTEs,
 I/O errors, partial usercopy, buffer/range rejection and reference cleanup.
 This is not proof of real hardware MMU/cache behavior or vendor ABI compatibility.
+Run `python3 tests/run_swap_reader_abi_host.py` to exercise source-signature
+detection and compile/run the production call wrapper for page/folio returns
+and all supported poll/plug argument combinations. This test also checks that
+unknown and incomplete signatures fail closed.
 
 The Android SDK build includes dfm_memory_read_check. With the matching module
 already loaded, run it as root on an authorized test device. It uses only its
@@ -56,6 +65,10 @@ requires /proc/self/pagemap evidence of swap entries. It compares the returned
 bytes against saved data and verifies those swap slots remain nonresident.
 Exit 77 means no swap entry was observed: it is a skip, not a pass. The test never
 loads/unloads modules or changes root/SELinux settings.
+It reports the kernel release, capability response and exact SDK ioctl result
+on read failure. Capability bits do not identify the loaded module commit or
+prove that the swap backend is enabled. Each read gets a freshly poisoned
+output buffer, so a previous successful read cannot mask missing output.
 
 Local host checks and Android SDK/test builds passed. Six-KMI CI results and
 real-device results must be recorded separately; no device success is implied by
