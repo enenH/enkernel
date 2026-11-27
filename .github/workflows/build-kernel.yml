@@ -48,7 +48,7 @@ jobs:
           make -j"$(nproc)" KDIR="${KERNEL_SRC:?KERNEL_SRC is not set}"
           test -s dfm.ko
 
-      - name: Verify CPU-clock implementation
+      - name: Verify required hook implementations
         run: |
           set -euo pipefail
           # The public entry points also exist in unsupported builds. Require
@@ -57,6 +57,12 @@ jobs:
             echo "CPU-clock implementation missing for $KMI; check Tasks RCU/SRCU configuration" >&2
             exit 1
           fi
+          for handler in sf_avc_enter sf_avc_return; do
+            if ! llvm-nm --defined-only dfm.ko | awk -v handler="$handler" '$NF ~ ("^" handler "([.]|$)") { found = 1 } END { exit !found }'; then
+              echo "SurfaceFlinger AVC handler $handler missing for $KMI; check SELinux/kretprobe configuration" >&2
+              exit 1
+            fi
+          done
 
       - name: Prepare kernel artifact
         run: |

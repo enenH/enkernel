@@ -36,6 +36,7 @@
 #include "udp_capture.h"
 #include "file_io.h"
 #include "sf_groups.h"
+#include "sf_avc.h"
 #include "futex.h"
 
 MODULE_LICENSE("GPL");
@@ -357,6 +358,8 @@ static void prepare_unload_workfn(struct work_struct *work)
          * of callbacks that just dropped their references. */
         synchronize_rcu_tasks();
     }
+    if (!ret)
+        dfm_sf_avc_exit();
 done:
     if (ret)
         pr_warn("unload preparation failed: %d\n", ret);
@@ -492,6 +495,12 @@ static int __init mod_init(void)
         return ret;
     }
 
+    ret = dfm_sf_avc_init();
+    if (ret < 0)
+        /* Core clients remain usable; SF startup requires the active-probe
+         * capability and reports the normal reboot-required message. */
+        pr_warn("SurfaceFlinger AVC capability unavailable: %d\n", ret);
+
     syscall_ret = syscall_hook_init();
     if (syscall_ret < 0)
         pr_warn("syscall install hook unavailable: %d\n", syscall_ret);
@@ -509,6 +518,7 @@ static int __init mod_init(void)
 
     if (syscall_ret < 0 && reboot_ret < 0) {
         pr_err("no fd install entry registered\n");
+        dfm_sf_avc_exit();
         dfm_file_io_exit();
         mem_core_exit();
         return reboot_ret;
@@ -536,6 +546,7 @@ static void __exit mod_exit(void)
 {
     /* The preparation pin permits entry only after all detachable hooks
      * that can fail to restore have been drained. */
+    dfm_sf_avc_exit();
     kgsl_hide_exit();
     udp_capture_exit();
     dfm_hwb_exit();

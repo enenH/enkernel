@@ -65,6 +65,7 @@
 #define DFM_CAP_FUTEX_THREADS    (1ULL << 0)
 #define DFM_CAP_UDP_SOCKET_BIND  (1ULL << 1)
 #define DFM_CAP_UDP_CAPTURE_V2   (1ULL << 2)
+#define DFM_CAP_SF_AVC_BYPASS    (1ULL << 3)
 #define DFM_CAP_REQUIRED (DFM_CAP_FUTEX_THREADS | DFM_CAP_UDP_SOCKET_BIND | DFM_CAP_UDP_CAPTURE_V2)
 /* Read-only handshake. A version-0 request is rejected before any operation.
  * Features describe implemented transports, not a guarantee that every target
