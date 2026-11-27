@@ -532,6 +532,45 @@ namespace dfm {
         return g_last_ioctl_result == 0;
     }
 
+    long pte_info(dfm_pte_info_req& out) {
+        out = {};
+        if (g_fd < 0) return -EBADF;
+        dfm_pte_info_req req{};
+        req.abi_version = DFM_PTE_ABI_VERSION;
+        const long ret = call_ioctl(g_fd, DFM_IOCTL_PTE_INFO, (long)&req);
+        if (!ret) out = req;
+        return ret;
+    }
+
+    long pte_set(int pid, const uint64_t* addresses, size_t count) {
+        if (g_fd < 0) return -EBADF;
+        if (pid <= 0 || !addresses || !count || count > DFM_PTE_MAX_POINTS)
+            return -EINVAL;
+        dfm_pte_set_req req{};
+        req.abi_version = DFM_PTE_ABI_VERSION;
+        req.pid = pid;
+        req.point_count = static_cast<uint32_t>(count);
+        std::memcpy(req.addresses, addresses, count * sizeof(*addresses));
+        return call_ioctl(g_fd, DFM_IOCTL_PTE_SET, (long)&req);
+    }
+
+    long pte_read(dfm_pte_snapshot& out) {
+        out = {};
+        if (g_fd < 0) return -EBADF;
+        dfm_pte_read_req req{};
+        req.abi_version = DFM_PTE_ABI_VERSION;
+        req.buf = reinterpret_cast<uint64_t>(&out);
+        req.buf_size = sizeof(out);
+        const long ret = call_ioctl(g_fd, DFM_IOCTL_PTE_READ, (long)&req);
+        if (ret) out = {};
+        return ret;
+    }
+
+    long pte_clear() {
+        if (g_fd < 0) return -EBADF;
+        return call_ioctl(g_fd, DFM_IOCTL_PTE_CLEAR, 0);
+    }
+
     bool udp_cap_init(int pid, uint16_t minPayload, uint16_t maxPayload) {
         udp_cap_init_req req{};
         req.pid = pid;

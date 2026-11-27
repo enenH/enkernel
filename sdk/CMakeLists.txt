@@ -65,4 +65,5 @@ install(DIRECTORY include/dfm DESTINATION include)
 install(FILES ../abi.h DESTINATION include/dfm)
 install(FILES examples/basic.cpp examples/CMakeLists.txt DESTINATION examples)
 install(FILES ../docs/shared-ipc.md ../docs/shared-ipc-validation.md
+    ../docs/pte-breakpoints.md
     DESTINATION share/doc/enkernel)

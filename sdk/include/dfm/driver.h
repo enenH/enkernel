@@ -85,6 +85,13 @@ namespace dfm {
     bool hwb_set(int targetTid, const dfm_hwb_point_req* points, size_t pointCount);
     bool hwb_read(dfm_hwb_snapshot& out);
     bool hwb_clear();
+    /* Persistent UXN execution tracing; negative errno, no fallback. CLEAR is
+     * idempotent. Only the file description that SET the session can read or
+     * clear it. See docs/pte-breakpoints.md for page/stepping restrictions. */
+    long pte_info(dfm_pte_info_req& out);
+    long pte_set(int pid, const uint64_t* addresses, size_t count);
+    long pte_read(dfm_pte_snapshot& out);
+    long pte_clear();
     /* Raw result of the most recent issued ioctl on this thread (negative errno).
      * Argument validation can fail before issuing an ioctl; do not rely on libc errno. */
     long last_ioctl_result();

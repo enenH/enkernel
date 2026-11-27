@@ -61,6 +61,10 @@
 #define MEM_IOC_CAPABILITIES      _IOWR('D', 42, struct dfm_capabilities_req)
 #define UDP_IOC_READ_V2           _IOWR('D', 44, struct udp_cap_read_v2_req)
 #define DFM_FILE_IOC_QUERY_FD     _IOWR('D', 45, struct dfm_file_query_req)
+#define DFM_IOCTL_PTE_INFO       _IOWR('D', 46, struct dfm_pte_info_req)
+#define DFM_IOCTL_PTE_SET        _IOW('D', 47, struct dfm_pte_set_req)
+#define DFM_IOCTL_PTE_READ       _IOWR('D', 48, struct dfm_pte_read_req)
+#define DFM_IOCTL_PTE_CLEAR      _IO('D', 49)
 
 #define DFM_CAPABILITIES_ABI_VERSION 1U
 #define DFM_CAP_FUTEX_THREADS    (1ULL << 0)
@@ -68,6 +72,7 @@
 #define DFM_CAP_UDP_CAPTURE_V2   (1ULL << 2)
 #define DFM_CAP_FILE_QUERY_FD    (1ULL << 3)
 #define DFM_CAP_SENSOR_SYSTEMUI  (1ULL << 4)
+#define DFM_CAP_PTE_EXEC         (1ULL << 5)
 #define DFM_CAP_REQUIRED (DFM_CAP_FUTEX_THREADS | DFM_CAP_UDP_SOCKET_BIND | DFM_CAP_UDP_CAPTURE_V2)
 /* Read-only handshake. A version-0 request is rejected before any operation.
  * Features describe implemented transports, not a guarantee that every target
@@ -77,6 +82,62 @@ struct dfm_capabilities_req {
     uint32_t out_abi_version;
     uint64_t out_features;
     uint64_t reserved[2];
+};
+
+/* Persistent ARM64 execution tracing using UXN and native single stepping.
+ * A single file-owned session observes one exact mm, not a reusable PID.
+ * Private, resident, base-page RX mappings with VM_MAYWRITE are required.
+ * PTE permissions affect every thread sharing the mm. Other threads may pass
+ * through a page during its native-step window; this is not a lossless tracer.
+ * Mapping invalidation disarms affected pages. Unsupported exclusive/atomic
+ * instructions disarm a page rather than disturb its reservation semantics.
+ * Only GPR state is collected. No instruction bytes or register values change.
+ * SET requires CAP_SYS_PTRACE in init_user_ns and target ptrace permission.
+ * INFO reports runtime backend availability; the capability bit names the ABI.
+ */
+#define DFM_PTE_ABI_VERSION 1U
+#define DFM_PTE_MAX_POINTS 16U
+#define DFM_PTE_MAX_RECORDS 64U
+#define DFM_PTE_MAX_STEPPERS 64U
+#define DFM_PTE_INFO_AVAILABLE (1U << 0)
+#define DFM_PTE_INFO_STEP_WINDOW (1U << 1)
+#define DFM_PTE_ACTIVE (1U << 0)
+#define DFM_PTE_INVALIDATED (1U << 1)
+struct dfm_pte_info_req {
+    uint32_t abi_version, flags;
+    uint32_t page_size, max_points, max_records, max_steppers;
+    int32_t backend_errno;
+    uint32_t reserved;
+};
+struct dfm_pte_set_req {
+    uint32_t abi_version;
+    int32_t pid;
+    uint32_t point_count, flags;
+    uint64_t addresses[DFM_PTE_MAX_POINTS];
+    uint64_t reserved[2];
+};
+struct dfm_pte_record {
+    uint64_t sequence, timestamp_ns, address, pc, sp, pstate;
+    uint64_t x[31];
+    int32_t pid, tid;
+};
+/* Non-destructive, oldest-to-newest bounded snapshot. dropped counts records
+ * overwritten by the ring; it does not count unobservable concurrent passes.
+ * armed_pages/open_pages index the deduplicated pages in first-point order.
+ * last_error is negative errno; zero does not promise lossless observation. */
+struct dfm_pte_snapshot {
+    uint32_t abi_version, flags;
+    int32_t pid, last_error;
+    uint32_t point_count, page_count, record_count, reserved;
+    uint64_t generation, total_hits, faults, rearms, dropped;
+    uint32_t armed_pages, open_pages;
+    uint64_t addresses[DFM_PTE_MAX_POINTS];
+    struct dfm_pte_record records[DFM_PTE_MAX_RECORDS];
+};
+struct dfm_pte_read_req {
+    uint32_t abi_version, reserved;
+    uint64_t buf, buf_size, out_size;
+    uint64_t reserved2;
 };
 
 /* Read-only regular-file operations addressed by target PID/FD. The driver fd

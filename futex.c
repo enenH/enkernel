@@ -397,6 +397,6 @@ long dfm_capabilities(void __user *arg)
     if (req.abi_version != DFM_CAPABILITIES_ABI_VERSION ||
         req.reserved[0] || req.reserved[1]) return -EINVAL;
     req.out_abi_version = DFM_CAPABILITIES_ABI_VERSION;
-    req.out_features = DFM_CAP_REQUIRED | DFM_CAP_FILE_QUERY_FD | DFM_CAP_SENSOR_SYSTEMUI;
+    req.out_features = DFM_CAP_REQUIRED | DFM_CAP_FILE_QUERY_FD | DFM_CAP_SENSOR_SYSTEMUI | DFM_CAP_PTE_EXEC;
     return copy_to_user(arg, &req, sizeof(req)) ? -EFAULT : 0;
 }

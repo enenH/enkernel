@@ -9,6 +9,9 @@ int  syscall_hook_init(void);
 void syscall_hook_exit(void);
 int  syscall_hook_nr(void);
 
+/* Internal checked pointer replacement, using the existing text-poke path. */
+int dfm_patch_pointer(void *slot, void *replacement, void *expected);
+
 int  syscall_cpu_clock_init(void);
 void syscall_cpu_clock_exit(void);
 long syscall_cpu_clock_set_target(void __user *arg);

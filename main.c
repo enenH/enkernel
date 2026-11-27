@@ -30,6 +30,7 @@
 #include "fd_query.h"
 #include "sf_groups.h"
 #include "futex.h"
+#include "pte_bp.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DFM");
@@ -42,6 +43,14 @@ static long drv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     void __user *argp = (void __user *)arg;
 
     switch (cmd) {
+    case DFM_IOCTL_PTE_INFO:
+        return dfm_pte_info(argp);
+    case DFM_IOCTL_PTE_SET:
+        return dfm_pte_set(filp, argp);
+    case DFM_IOCTL_PTE_READ:
+        return dfm_pte_read(filp, argp);
+    case DFM_IOCTL_PTE_CLEAR:
+        return dfm_pte_clear(filp);
     case MEM_IOC_CAPABILITIES:
         return dfm_capabilities(argp);
     case MEM_IOC_FUTEX_WAITERS:
@@ -131,6 +140,7 @@ static long drv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 static int drv_release(struct inode *inode, struct file *filp)
 {
+    dfm_pte_release(filp);
     dfm_futex_release(filp);
     dfm_hwb_release_owner(filp);
     udp_capture_stop();
@@ -329,6 +339,7 @@ static int __init mod_init(void)
 
 static void __exit mod_exit(void)
 {
+    dfm_pte_exit();
     syscall_cpu_clock_exit();
     kgsl_hide_exit();
     if (g_reboot_kprobe_registered) {
