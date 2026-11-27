@@ -23,6 +23,7 @@
 #include <linux/uaccess.h>
 #include <linux/user_namespace.h>
 #include <linux/vmalloc.h>
+#include <trace/events/sched.h>
 #include <asm/debug-monitors.h>
 #include <asm/esr.h>
 #include <asm/pgtable.h>
@@ -384,9 +385,15 @@ static void signal_deliver(void *unused, int sig, struct kernel_siginfo *info,
     (void)unused; (void)sig; (void)info; (void)action;
     cancel_current(task_pt_regs(current));
 }
+#ifdef DFM_PTE_EXIT_GROUP_DEAD
+static void task_exit(void *unused, struct task_struct *task, bool group_dead)
+{
+    (void)unused; (void)group_dead;
+#else
 static void task_exit(void *unused, struct task_struct *task)
 {
     (void)unused;
+#endif
     if (task == current) cancel_current(task_pt_regs(task));
 }
 static void task_fork(void *unused, struct task_struct *parent,
@@ -569,6 +576,10 @@ static int ensure_hooks(void)
     rc = tracepoint_probe_register(fork_trace, task_fork, NULL);
     if (rc) return rc;
     fork_registered = true;
+    /* Keep runtime-resolved tracepoints, while having the kernel headers
+     * reject a CFI-incompatible callback on any supported/backported ABI. */
+    check_trace_callback_type_sched_process_exit(task_exit);
+    check_trace_callback_type_sched_process_fork(task_fork);
     rc = tracepoint_probe_register(exit_trace, task_exit, NULL);
     if (rc) return rc;
     exit_registered = true;

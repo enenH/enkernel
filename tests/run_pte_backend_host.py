@@ -14,7 +14,8 @@ with tempfile.TemporaryDirectory(prefix='dfm-pte-abi-') as directory:
     header = tree / 'arch/arm64/include/asm/debug-monitors.h'
     fault = tree / 'arch/arm64/mm/fault.c'
     monitor = tree / 'arch/arm64/kernel/debug-monitors.c'
-    for path in (header, fault, monitor):
+    sched = tree / 'include/trace/events/sched.h'
+    for path in (header, fault, monitor, sched):
         path.parent.mkdir(parents=True, exist_ok=True)
 
     def write(path, text, crlf):
@@ -26,6 +27,8 @@ with tempfile.TemporaryDirectory(prefix='dfm-pte-abi-') as directory:
 
     for crlf in (False, True):
         for width in ('int', 'long'):
+            write(sched, 'DEFINE_EVENT(sched_process_template, sched_process_exit,\n'
+                  ' TP_PROTO(struct task_struct *p), TP_ARGS(p));\n', crlf)
             write(fault, 'struct fault_info {\n'
                   f' int (*fn)(unsigned long far, unsigned {width} esr, struct pt_regs *regs);\n'
                   ' int sig, code;\n const char *name;\n};\n', crlf)
@@ -38,9 +41,11 @@ with tempfile.TemporaryDirectory(prefix='dfm-pte-abi-') as directory:
             assert detect() == expected
 
         write(header, '/* Legacy step hook removed. */\n', crlf)
+        write(sched, 'TRACE_EVENT(sched_process_exit,\n'
+              ' TP_PROTO(struct task_struct *p, bool group_dead), TP_ARGS(p, group_dead));\n', crlf)
         signature = 'void do_el0_softstep(unsigned long esr, struct pt_regs *regs)\n'
         write(monitor, signature + '{ }\n', crlf)
-        assert detect() == ['-DDFM_PTE_SOFTSTEP_KPROBE']
+        assert detect() == ['-DDFM_PTE_SOFTSTEP_KPROBE', '-DDFM_PTE_EXIT_GROUP_DEAD']
         write(monitor, signature + '{ }\nNOKPROBE_SYMBOL(do_el0_softstep);\n', crlf)
         assert detect() == []
         write(monitor, signature.replace('void ', 'int ', 1) + '{ return 0; }\n', crlf)

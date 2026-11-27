@@ -48,17 +48,19 @@ struct mmu_notifier { int unused; };
 struct mmu_notifier_range { unsigned long start, end; };
 struct pt_regs { uint64_t regs[31], sp, pc, pstate; int kernel, compat; };
 struct task_struct { struct mm_struct *mm; int ptrace, step, refs, pid, tid; };
+struct kernel_siginfo {};
+struct k_sigaction {};
 struct step_hook { int (*fn)(struct pt_regs *, unsigned long); };
 typedef uint32_t kprobe_opcode_t;
 struct kprobe { kprobe_opcode_t *addr; int (*pre_handler)(struct kprobe *, struct pt_regs *); };
 static struct pt_regs regs;
+static struct pt_regs *task_pt_regs(struct task_struct *task) { (void)task; return &regs; }
 #define instruction_pointer_set(r, value) ((r)->pc = (value))
 #ifdef DFM_PTE_USER_STEP_HOOK
 static int registrations, unregistrations;
 static void register_step(struct step_hook *hook) { assert(hook->fn); ++registrations; }
 static void unregister_step(struct step_hook *hook) { assert(hook->fn); ++unregistrations; }
 #else
-static struct pt_regs *task_pt_regs(struct task_struct *task) { (void)task; return &regs; }
 static struct kprobe softstep_probe;
 static uintptr_t softstep_address = 0x4000;
 static int register_result, registrations, unregistrations, relocate_probe;
@@ -224,6 +226,19 @@ int main(void)
     assert(!state.active && !(mm.entries[0] & PTE_UXN));
     assert(!handle_fault(regs.pc, syndrome, &regs));
     assert(tlbs > 0);
+    reset(); assert(handle_fault(regs.pc, syndrome, &regs));
+    sys_enter(NULL, &regs, 0);
+    assert(!task.step && !task.refs && state.page[0].armed);
+    reset(); assert(handle_fault(regs.pc, syndrome, &regs));
+    signal_deliver(NULL, 0, NULL, NULL);
+    assert(!task.step && !task.refs && state.page[0].armed);
+    reset(); assert(handle_fault(regs.pc, syndrome, &regs));
+#ifdef DFM_PTE_EXIT_GROUP_DEAD
+    task_exit(NULL, &task, true);
+#else
+    task_exit(NULL, &task);
+#endif
+    assert(!task.step && !task.refs && state.page[0].armed);
     puts("PTE production fault/step/notifier model passed");
     return 0;
 }

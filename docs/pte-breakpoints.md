@@ -59,6 +59,8 @@ custom entry trampoline or syscall body is patched. Optional symbols, known faul
 table layout, MMU notifiers, Tasks RCU/SRCU and syscall tracepoints are required;
 unknown/absent support fails with EOPNOTSUPP. Callback syndrome widths are
 detected from the selected kernel source, including the 32-bit 5.10 ABI.
+The changed sched_process_exit group_dead argument is detected independently,
+and kernel trace headers type-check the exit/fork callbacks during compilation.
 The native backend targets Android 5.10/5.15/6.1/6.6/6.12/6.18. On older kernels
 it registers a user-step hook. When that API is absent, the build detector
 accepts only the recognized void do_el0_softstep(unsigned long, pt_regs *) entry
