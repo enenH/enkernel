@@ -19,7 +19,8 @@ def section(start, end):
 source = section('struct pte_page {', 'static DEFINE_MUTEX(control_lock);')
 source += '\ntypedef unsigned long pte_step_esr_t;\nstatic struct pte_session *session;\n'
 source += section('static int set_armed(', 'static void disable_local_step(')
-source += section('static void finish_step(', 'static struct step_hook step_hook')
+source += section('static void finish_step(', '/* PTE_STEP_ROUTER_END */')
+source += section('/* PTE_STEP_REGISTRATION_BEGIN */', '/* PTE_STEP_REGISTRATION_END */')
 source += section('static void record_hit(', '#define FAULT_WRAPPER')
 source += section('static void cancel_current(', 'static void sys_enter(')
 source += section('static int invalidate_start(', 'static const struct mmu_notifier_ops')
@@ -30,10 +31,12 @@ with tempfile.TemporaryDirectory(prefix='dfm-pte-') as directory:
         (directory / 'sys').mkdir()
         (directory / 'sys/ioctl.h').write_text('/* No host ioctl calls. */\n')
     (directory / 'pte_under_test.h').write_text(source)
-    for opt in ('-O0', '-O2'):
-        binary = directory / ('pte' + opt + '.exe')
-        subprocess.run([a.compiler, '-std=gnu11', opt, '-Wall', '-Wextra',
-                        '-Werror', '-UNDEBUG', '-I', str(directory), '-I', str(root),
-                        str(root / 'tests/pte_host.c'), '-o', str(binary)], check=True)
-        subprocess.run([str(binary)], check=True)
-        print('DFM_PTE_HOST_PASS', opt, flush=True)
+    for backend in ('USER_STEP_HOOK', 'SOFTSTEP_KPROBE'):
+        for opt in ('-O0', '-O2'):
+            binary = directory / ('pte-' + backend + opt + '.exe')
+            subprocess.run([a.compiler, '-std=gnu11', opt, '-Wall', '-Wextra',
+                            '-Werror', '-UNDEBUG', '-DDFM_PTE_' + backend,
+                            '-I', str(directory), '-I', str(root),
+                            str(root / 'tests/pte_host.c'), '-o', str(binary)], check=True)
+            subprocess.run([str(binary)], check=True)
+            print('DFM_PTE_HOST_PASS', backend, opt, flush=True)

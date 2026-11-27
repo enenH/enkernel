@@ -47,13 +47,13 @@ jobs:
           set -euo pipefail
           make -j"$(nproc)" KDIR="${KERNEL_SRC:?KERNEL_SRC is not set}"
           test -s dfm.ko
-          # Require the native backend on the five supported hook ABIs.
+          # Never accept a stub-only build of the PTE ABI.
+          llvm-nm --defined-only dfm.ko | awk '$NF ~ /^step_handler([.]|$)/ { found = 1 } END { exit !found }'
           if [[ "$KMI" == android17-6.18 ]]; then
-            echo 'PTE: 6.18 removed user-step hooks; explicit EOPNOTSUPP backend'
-            ! grep -q -- '-DDFM_PTE_USER_STEP_HOOK' .pte_bp.o.cmd
+            grep -q -- '-DDFM_PTE_SOFTSTEP_KPROBE' .pte_bp.o.cmd
+            llvm-nm --defined-only dfm.ko | awk '$NF ~ /^softstep_pre([.]|$)/ { found = 1 } END { exit !found }'
           else
             grep -q -- '-DDFM_PTE_USER_STEP_HOOK' .pte_bp.o.cmd
-            llvm-nm --defined-only dfm.ko | awk '$NF ~ /^step_handler([.]|$)/ { found = 1 } END { exit !found }'
           fi
           # Fail if source-tree ABI detection silently disabled swap support.
           grep -q -- '-DDFM_SWAP_READER_KNOWN' .mem.o.cmd
@@ -107,6 +107,7 @@ jobs:
           python3 tests/run_swap_reader_abi_host.py
           python3 tests/run_shared_ipc_host.py
           python3 tests/run_pte_host.py
+          python3 tests/run_pte_backend_host.py
           c++ -std=c++17 -Wall -Wextra -Werror tests/process_mem_policy.cpp -o /tmp/dfm-policy-check
           /tmp/dfm-policy-check
           cmake -S . -B build/sdk -G Ninja \

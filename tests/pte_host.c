@@ -27,6 +27,9 @@ typedef int spinlock_t;
 #define DBG_HOOK_HANDLED 0
 #define ESR_ELx_EC(esr) ((esr) >> 26)
 #define ESR_ELx_EC_IABT_LOW 0x20
+#define ESR_ELx_EC_SOFTSTP_LOW 0x32
+#define __nocfi
+#define NOKPROBE_SYMBOL(name)
 #define ESR_ELx_FSC 0x3f
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x, v) ((x) = (v))
@@ -45,6 +48,29 @@ struct mmu_notifier { int unused; };
 struct mmu_notifier_range { unsigned long start, end; };
 struct pt_regs { uint64_t regs[31], sp, pc, pstate; int kernel, compat; };
 struct task_struct { struct mm_struct *mm; int ptrace, step, refs, pid, tid; };
+struct step_hook { int (*fn)(struct pt_regs *, unsigned long); };
+typedef uint32_t kprobe_opcode_t;
+struct kprobe { kprobe_opcode_t *addr; int (*pre_handler)(struct kprobe *, struct pt_regs *); };
+static struct pt_regs regs;
+#define instruction_pointer_set(r, value) ((r)->pc = (value))
+#ifdef DFM_PTE_USER_STEP_HOOK
+static int registrations, unregistrations;
+static void register_step(struct step_hook *hook) { assert(hook->fn); ++registrations; }
+static void unregister_step(struct step_hook *hook) { assert(hook->fn); ++unregistrations; }
+#else
+static struct pt_regs *task_pt_regs(struct task_struct *task) { (void)task; return &regs; }
+static struct kprobe softstep_probe;
+static uintptr_t softstep_address = 0x4000;
+static int register_result, registrations, unregistrations, relocate_probe;
+static int register_kprobe(struct kprobe *probe)
+{
+    assert((uintptr_t)probe->addr == softstep_address && probe->pre_handler);
+    ++registrations;
+    if (!register_result && relocate_probe) probe->addr++;
+    return register_result;
+}
+static void unregister_kprobe(struct kprobe *probe) { assert(probe == &softstep_probe); ++unregistrations; }
+#endif
 static struct task_struct *current;
 static spinlock_t state_lock;
 static int tlbs;
@@ -82,7 +108,6 @@ static struct pte_session state;
 static struct mm_struct mm;
 static struct task_struct task;
 static struct page code;
-static struct pt_regs regs;
 static const unsigned long syndrome = (0x20UL << 26) | 15;
 static void reset(void)
 {
@@ -101,6 +126,19 @@ static void reset(void)
 }
 int main(void)
 {
+    assert(step_register_call(true) == 0 && registrations == 1);
+    assert(step_register_call(false) == 0 && unregistrations == 1);
+#ifdef DFM_PTE_SOFTSTEP_KPROBE
+    register_result = -EBUSY;
+    assert(step_register_call(true) == -EBUSY && registrations == 2);
+    assert(unregistrations == 1);
+    register_result = 0;
+    assert(step_register_call(true) == 0);
+    assert(step_register_call(false) == 0 && unregistrations == 2);
+    relocate_probe = 1;
+    assert(step_register_call(true) == -EOPNOTSUPP && unregistrations == 3);
+    relocate_probe = 0;
+#endif
     struct dfm_pte_set_req request = { .abi_version = 1, .pid = 1, .point_count = 1,
                                      .addresses = {4096} };
     assert(dfm_pte_validate(&request, 1ULL << 48) == 0);
@@ -116,7 +154,31 @@ int main(void)
         assert(handle_fault(regs.pc, syndrome, &regs));
         assert(task.step && task.refs == 1 && !(mm.entries[0] & PTE_UXN));
         assert(state.snapshot.total_hits == i + 1 && !state.page[0].armed);
-        assert(step_handler(&regs, 0) == DBG_HOOK_HANDLED);
+#ifdef DFM_PTE_SOFTSTEP_KPROBE
+        struct pt_regs entry = { .pc = softstep_address };
+        entry.regs[0] = (0x32ULL << 26);
+        entry.regs[1] = (uintptr_t)&regs;
+        entry.regs[30] = 0x8000;
+        struct pt_regs unrelated_regs = {0};
+        entry.regs[1] = (uintptr_t)&unrelated_regs;
+        assert(softstep_pre(&softstep_probe, &entry) == 0 && task.step);
+        entry.regs[1] = (uintptr_t)&regs;
+        entry.regs[0] = syndrome;
+        assert(softstep_pre(&softstep_probe, &entry) == 0 && task.step);
+        entry.regs[0] = (0x32ULL << 26);
+        regs.kernel = 1;
+        assert(softstep_pre(&softstep_probe, &entry) == 0 && task.step);
+        regs.kernel = 0; regs.compat = 1;
+        assert(softstep_pre(&softstep_probe, &entry) == 0 && task.step);
+        regs.compat = 0;
+        assert(softstep_pre(&softstep_probe, &entry) == 1);
+        assert(entry.pc == 0x8000 && entry.regs[30] == 0x8000);
+        assert(entry.regs[0] == (0x32ULL << 26) && entry.regs[1] == (uintptr_t)&regs);
+        entry.pc = softstep_address;
+        assert(softstep_pre(&softstep_probe, &entry) == 0 && entry.pc == softstep_address);
+#else
+        assert(step_hook.fn(&regs, 0) == DBG_HOOK_HANDLED);
+#endif
         assert(!task.step && task.refs == 0 && (mm.entries[0] & PTE_UXN));
     }
     assert(state.snapshot.record_count == 64 && state.snapshot.dropped == 136);

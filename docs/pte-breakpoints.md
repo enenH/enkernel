@@ -55,14 +55,22 @@ The backend verifies and replaces the ARM64 level 1/2/3 permission-fault
 callbacks using the existing checked pointer-patch mechanism. Only EL0 ARM64
 level-3 instruction permission faults for the exact managed mm/page are
 consumed. Other faults call the retained original callback. No instruction
-entry trampoline or syscall body is patched. Optional symbols, known fault
+custom entry trampoline or syscall body is patched. Optional symbols, known fault
 table layout, MMU notifiers, Tasks RCU/SRCU and syscall tracepoints are required;
 unknown/absent support fails with EOPNOTSUPP. Callback syndrome widths are
 detected from the selected kernel source, including the 32-bit 5.10 ABI.
-The native backend targets Android 5.10/5.15/6.1/6.6/6.12. Linux 6.18 removed
-the user-step hook API and is explicitly unsupported: its module still builds,
-INFO reports EOPNOTSUPP and SET never changes a PTE. No instruction trampoline
-or additional hardware breakpoint is substituted on that kernel.
+The native backend targets Android 5.10/5.15/6.1/6.6/6.12/6.18. On older kernels
+it registers a user-step hook. When that API is absent, the build detector
+accepts only the recognized void do_el0_softstep(unsigned long, pt_regs *) entry
+and uses the standard Kprobes API there. The pre-handler validates the current
+task's EL0 register frame and software-step syndrome, completes an owned step,
+then skips the already-consumed void call by returning to its unmodified entry
+LR. Unowned events execute the original instruction and normal uprobe/SIGTRAP
+path. Kprobes owns kernel text changes, instruction slots and synchronization;
+no custom relocation/trampoline or hardware breakpoint slot is used.
+Unknown signatures, blacklisted entries, absent CONFIG_KPROBES, symbol absence
+and registration conflicts fail explicitly before any PTE is armed. INFO does
+not probe the function; successful SET is required to establish registration.
 
 PTE updates take the leaf lock, revalidate the PMD and expected PTE, preserve
 live access/dirty bits, and broadcast TLB invalidation (including KPTI ASIDs).
@@ -84,7 +92,8 @@ progress. These failures are visible in last_error/DFM_PTE_INVALIDATED.
 CLEAR/final close first stops new steps and restores managed permissions. A
 stop-machine rendezvous clears owned saved stepping state before references
 are freed; unrelated CPU debug controls are left untouched. Failed rendezvous
-attempts retain the session references and retry. Module exit detaches the callbacks and
+attempts retain the session references and retry. Module exit unregisters the
+6.18 Kprobe (which drains pre-handlers), detaches the callbacks and
 drains both fetched entries and sleeping original-fault calls with Tasks RCU
 and SRCU before releasing callback text. Partial SET/hook installation rolls
 back installed state. Stale unrelated PTE changes are never overwritten.
@@ -99,15 +108,23 @@ not a lossless all-thread instruction trace. Scheduling, signals and other
 debug facilities can lengthen the window. Paging/permission changes and
 unsupported instructions stop observation on that page. Instrumentation also
 adds exceptions and affects timing. Standard OS visibility/security remains.
+On the Kprobe backend, do not disable Kprobes globally while a session is
+active; CLEAR all sessions first. External instrumentation that disables or
+overwrites the probe is outside the session's ownership.
 
 ## Validation
 
     python3 tests/run_pte_host.py
+    python3 tests/run_pte_backend_host.py
 
 The host model executes production fault, native-step completion, ring and MMU
 notifier paths at O0/O2. It covers repeated rearming, AF/dirty preservation,
 stale PFNs, invalidation during a step, wrong mm/fault type, existing stepping,
-exclusive rejection, bounds and ring overflow. The Windows runner only shims
+exclusive rejection, bounds and ring overflow. Both legacy and 6.18 routing
+run at O0/O2, including foreign frames, wrong syndrome/mode, unowned events,
+entry-LR preservation, registration errors and cleanup. Source-tree detection
+tests cover legacy callback widths, 6.18, blacklists, unknown ABI and CRLF.
+The Windows runner only shims
 the unused sys/ioctl.h include; it does not emulate kernel/MMU correctness.
 
 Build with ENKERNEL_BUILD_TESTS=ON and run dfm_pte_check as root on an authorized
@@ -116,8 +133,8 @@ own private ADD/RET page. It verifies two batches of exact persistent hits and
 GPR snapshots on an otherwise isolated child, native results, unchanged code,
 bounded ring behavior and clear/retry. Unsupported/old modules return exit 77
 (skip), never a pass. This test never loads/unloads modules or changes SELinux.
-Six-KMI CI requires the native backend on the five supported ABIs and explicitly
-checks the unsupported 6.18 path; an unexpected fallback fails the build.
+Six-KMI CI requires the native backend on every ABI and checks that 6.18 includes
+the softstep pre-handler; an unexpected fallback fails the build.
 
 Host/SDK/CI build results and device kernel runtime results must be recorded
 separately. No successful module runtime test is implied by source compilation.

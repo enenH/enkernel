@@ -4,6 +4,7 @@
 #include <linux/capability.h>
 #include <linux/delay.h>
 #include <linux/kallsyms.h>
+#include <linux/kprobes.h>
 #include <linux/ktime.h>
 #include <linux/mm.h>
 #include <linux/mmu_notifier.h>
@@ -35,7 +36,8 @@
 #define __nocfi __attribute__((no_sanitize("cfi")))
 #endif
 
-#if defined(DFM_PTE_USER_STEP_HOOK) && \
+#if (defined(DFM_PTE_USER_STEP_HOOK) || \
+     (defined(DFM_PTE_SOFTSTEP_KPROBE) && defined(CONFIG_KPROBES))) && \
     defined(CONFIG_MMU_NOTIFIER) && defined(CONFIG_TASKS_RCU) && \
     defined(CONFIG_HAVE_SYSCALL_TRACEPOINTS) && \
     (defined(CONFIG_SRCU) || defined(CONFIG_TREE_SRCU) || defined(CONFIG_TINY_SRCU))
@@ -89,8 +91,13 @@ static typeof(((struct pte_fault_info *)0)->fn) original_fault[3];
 static bool fault_patched[3], step_registered;
 static bool hooks_ready;
 static int backend_error = -EAGAIN;
+#ifdef DFM_PTE_USER_STEP_HOOK
 static void (*register_step)(struct step_hook *);
 static void (*unregister_step)(struct step_hook *);
+#else
+static unsigned long softstep_address;
+static struct kprobe softstep_probe;
+#endif
 static bool (*target_access)(struct task_struct *, unsigned int);
 static struct tracepoint *fork_trace, *exit_trace, *sys_trace, *signal_trace;
 static bool fork_registered, exit_registered, sys_registered, signal_registered;
@@ -194,7 +201,9 @@ static void disable_local_step(struct pt_regs *regs)
 {
     clear_thread_flag(TIF_SINGLESTEP);
     regs->pstate &= ~DBG_SPSR_SS;
-    write_sysreg(read_sysreg(mdscr_el1) & ~DBG_MDSCR_SS, mdscr_el1);
+    /* MDSCR_EL1.SS is bit zero on ARM64. The old DBG_MDSCR_SS alias was
+     * removed with the legacy hook API; do not alter MDE/KDE ownership. */
+    write_sysreg(read_sysreg(mdscr_el1) & ~1UL, mdscr_el1);
     isb();
 }
 
@@ -231,7 +240,31 @@ static int step_handler(struct pt_regs *regs, pte_step_esr_t esr)
     spin_unlock_irqrestore(&state_lock, flags);
     return result;
 }
+/* PTE_STEP_ROUTER_BEGIN: also exercised by the host production-path model. */
+#ifdef DFM_PTE_USER_STEP_HOOK
 static struct step_hook step_hook = { .fn = step_handler };
+#else
+static int softstep_pre(struct kprobe *probe, struct pt_regs *entry)
+{
+    unsigned long esr = entry->regs[0];
+    struct pt_regs *regs = (void *)entry->regs[1];
+    (void)probe;
+    /* This is the exact AAPCS entry of void do_el0_softstep(esr, regs),
+     * before its stack/PAC/SCS prologue. Never dereference an unrelated
+     * argument or consume another task/debugger's exception. */
+    if (regs != task_pt_regs(current) || !user_mode(regs) ||
+        compat_user_mode(regs) || ESR_ELx_EC(esr) != ESR_ELx_EC_SOFTSTP_LOW ||
+        step_handler(regs, esr) != DBG_HOOK_HANDLED)
+        return 0;
+    /* Kprobes owns the instruction slot and synchronization. Returning
+     * nonzero skips only this already-consumed void call; no custom text
+     * trampoline or kernel C call from a redirected PC is involved. */
+    instruction_pointer_set(entry, entry->regs[30]);
+    return 1;
+}
+NOKPROBE_SYMBOL(softstep_pre);
+#endif
+/* PTE_STEP_ROUTER_END */
 
 static void record_hit(struct pte_session *s, unsigned long pc,
                         struct pt_regs *regs)
@@ -464,11 +497,33 @@ static __nocfi bool may_access(struct task_struct *task)
 {
     return target_access(task, PTRACE_MODE_ATTACH_REALCREDS);
 }
-static __nocfi void step_register_call(bool add)
+/* PTE_STEP_REGISTRATION_BEGIN */
+static __nocfi int step_register_call(bool add)
 {
+#ifdef DFM_PTE_USER_STEP_HOOK
     if (add) register_step(&step_hook);
     else unregister_step(&step_hook);
+    return 0;
+#else
+    if (add) {
+        int rc;
+        /* unregister_kprobe drains handlers before this object is reused. */
+        memset(&softstep_probe, 0, sizeof(softstep_probe));
+        softstep_probe.addr = (kprobe_opcode_t *)softstep_address;
+        softstep_probe.pre_handler = softstep_pre;
+        rc = register_kprobe(&softstep_probe);
+        if (rc) return rc;
+        if (softstep_probe.addr != (kprobe_opcode_t *)softstep_address) {
+            unregister_kprobe(&softstep_probe);
+            return -EOPNOTSUPP;
+        }
+        return 0;
+    }
+    unregister_kprobe(&softstep_probe);
+    return 0;
+#endif
 }
+/* PTE_STEP_REGISTRATION_END */
 
 /* Keep hooks until module exit: no session clear frees callback text. */
 static int resolve_backend(void)
@@ -476,14 +531,21 @@ static int resolve_backend(void)
     unsigned int i;
     if (hooks_ready) return 0;
     fault_table = (void *)symbol("fault_info");
+#ifdef DFM_PTE_USER_STEP_HOOK
     register_step = (void *)symbol("register_user_step_hook");
     unregister_step = (void *)symbol("unregister_user_step_hook");
+    if (!register_step || !unregister_step) return -EOPNOTSUPP;
+#else
+    /* Probe the real function entry, never a legacy CFI jump-table thunk. */
+    softstep_address = kallsyms_lookup_name("do_el0_softstep");
+    if (!softstep_address) return -EOPNOTSUPP;
+#endif
     target_access = (void *)symbol("ptrace_may_access");
     fork_trace = (void *)symbol("__tracepoint_sched_process_fork");
     exit_trace = (void *)symbol("__tracepoint_sched_process_exit");
     sys_trace = (void *)symbol("__tracepoint_sys_enter");
     signal_trace = (void *)symbol("__tracepoint_signal_deliver");
-    if (!fault_table || !register_step || !unregister_step || !target_access ||
+    if (!fault_table || !target_access ||
         !fork_trace || !exit_trace || !sys_trace || !signal_trace) return -EOPNOTSUPP;
     for (i = 0; i < 3; ++i) {
         struct pte_fault_info *f = &fault_table[13 + i];
@@ -501,7 +563,9 @@ static int ensure_hooks(void)
     if (hooks_ready) return 0;
     rc = resolve_backend();
     if (rc) return rc;
-    step_register_call(true); step_registered = true;
+    rc = step_register_call(true);
+    if (rc) return rc;
+    step_registered = true;
     rc = tracepoint_probe_register(fork_trace, task_fork, NULL);
     if (rc) return rc;
     fork_registered = true;
