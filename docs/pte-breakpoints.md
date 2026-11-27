@@ -57,7 +57,12 @@ level-3 instruction permission faults for the exact managed mm/page are
 consumed. Other faults call the retained original callback. No instruction
 entry trampoline or syscall body is patched. Optional symbols, known fault
 table layout, MMU notifiers, Tasks RCU/SRCU and syscall tracepoints are required;
-unknown/absent support fails with EOPNOTSUPP.
+unknown/absent support fails with EOPNOTSUPP. Callback syndrome widths are
+detected from the selected kernel source, including the 32-bit 5.10 ABI.
+The native backend targets Android 5.10/5.15/6.1/6.6/6.12. Linux 6.18 removed
+the user-step hook API and is explicitly unsupported: its module still builds,
+INFO reports EOPNOTSUPP and SET never changes a PTE. No instruction trampoline
+or additional hardware breakpoint is substituted on that kernel.
 
 PTE updates take the leaf lock, revalidate the PMD and expected PTE, preserve
 live access/dirty bits, and broadcast TLB invalidation (including KPTI ASIDs).
@@ -111,7 +116,8 @@ own private ADD/RET page. It verifies two batches of exact persistent hits and
 GPR snapshots on an otherwise isolated child, native results, unchanged code,
 bounded ring behavior and clear/retry. Unsupported/old modules return exit 77
 (skip), never a pass. This test never loads/unloads modules or changes SELinux.
-Six-KMI CI must compile the native backend, not merely its unsupported stubs.
+Six-KMI CI requires the native backend on the five supported ABIs and explicitly
+checks the unsupported 6.18 path; an unexpected fallback fails the build.
 
 Host/SDK/CI build results and device kernel runtime results must be recorded
 separately. No successful module runtime test is implied by source compilation.

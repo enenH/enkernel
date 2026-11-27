@@ -3,6 +3,7 @@ $(MODULE_NAME)-objs := main.o mem.o process_mem.o touch.o touch_v2.o syscall.o k
 obj-m := $(MODULE_NAME).o
 
 ccflags-y += -Wno-unused-function -Wno-declaration-after-statement -Wno-gcc-compat
+ccflags-y += $(shell sh $(src)/scripts/detect_pte_backend.sh $(srctree))
 
 # Inspect the selected kernel tree: vendors backport swap ABI changes.
 ifneq ($(wildcard $(srctree)/mm/swap_state.c),)

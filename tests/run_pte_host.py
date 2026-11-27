@@ -17,7 +17,7 @@ def section(start, end):
     return s[at:s.index(end, at)]
 
 source = section('struct pte_page {', 'static DEFINE_MUTEX(control_lock);')
-source += '\nstatic struct pte_session *session;\n'
+source += '\ntypedef unsigned long pte_step_esr_t;\nstatic struct pte_session *session;\n'
 source += section('static int set_armed(', 'static void disable_local_step(')
 source += section('static void finish_step(', 'static struct step_hook step_hook')
 source += section('static void record_hit(', '#define FAULT_WRAPPER')

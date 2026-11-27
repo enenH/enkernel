@@ -35,7 +35,8 @@
 #define __nocfi __attribute__((no_sanitize("cfi")))
 #endif
 
-#if defined(CONFIG_MMU_NOTIFIER) && defined(CONFIG_TASKS_RCU) && \
+#if defined(DFM_PTE_USER_STEP_HOOK) && \
+    defined(CONFIG_MMU_NOTIFIER) && defined(CONFIG_TASKS_RCU) && \
     defined(CONFIG_HAVE_SYSCALL_TRACEPOINTS) && \
     (defined(CONFIG_SRCU) || defined(CONFIG_TREE_SRCU) || defined(CONFIG_TINY_SRCU))
 
@@ -64,11 +65,22 @@ static DEFINE_MUTEX(control_lock);
 static DEFINE_SPINLOCK(state_lock);
 static struct pte_session *session;
 static u64 generation;
-static DEFINE_STATIC_SRCU(fault_srcu);
+DEFINE_STATIC_SRCU(fault_srcu);
+
+#ifdef DFM_PTE_STEP_ESR32
+typedef unsigned int pte_step_esr_t;
+#else
+typedef unsigned long pte_step_esr_t;
+#endif
+#ifdef DFM_PTE_FAULT_ESR32
+typedef unsigned int pte_fault_esr_t;
+#else
+typedef unsigned long pte_fault_esr_t;
+#endif
 
 /* Layout from arch/arm64/mm/fault.c on the supported ARM64 kernels. */
 struct pte_fault_info {
-    int (*fn)(unsigned long, unsigned long, struct pt_regs *);
+    int (*fn)(unsigned long, pte_fault_esr_t, struct pt_regs *);
     int sig, code;
     const char *name;
 };
@@ -203,7 +215,7 @@ static void finish_step(struct pte_session *s, unsigned int index,
     put_task_struct(task);
 }
 
-static int step_handler(struct pt_regs *regs, unsigned long esr)
+static int step_handler(struct pt_regs *regs, pte_step_esr_t esr)
 {
     unsigned long flags;
     unsigned int i;
@@ -303,7 +315,7 @@ out:
 }
 
 #define FAULT_WRAPPER(n) \
-static __nocfi int fault_##n(unsigned long far, unsigned long esr, \
+static __nocfi int fault_##n(unsigned long far, pte_fault_esr_t esr, \
                              struct pt_regs *regs) \
 { \
     int index = srcu_read_lock(&fault_srcu); \
@@ -623,7 +635,7 @@ long dfm_pte_set(struct file *owner, void __user *arg)
         ptep = lock_pte(mm, address, &ptl);
         if (!ptep) { rc = -EFAULT; break; }
         entry = READ_ONCE(*ptep);
-        if (!pte_present(entry) || !pte_user(entry) || !pte_exec(entry) ||
+        if (!pte_valid(entry) || !(pte_val(entry) & PTE_USER) || !pte_user_exec(entry) ||
             pte_cont(entry) || !pfn_valid(pte_pfn(entry)) ||
             PageCompound(pfn_to_page(pte_pfn(entry)))) {
             unlock_pte(ptl); rc = -EOPNOTSUPP; break;
