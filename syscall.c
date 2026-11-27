@@ -205,6 +205,14 @@ static int syscall_patch_text(void *dst, const void *src, size_t len)
     return syscall_patch_text_expected(dst, src, NULL, len);
 }
 
+int dfm_patch_pointer(void *slot, void *replacement, void *expected)
+{
+    if (!slot || !replacement || !expected)
+        return -EINVAL;
+    return syscall_patch_text_expected(slot, &replacement, &expected,
+                                       sizeof(replacement));
+}
+
 static int syscall_patch_table(int nr, syscall_fn_t fn)
 {
     if (!g_sys_call_table)

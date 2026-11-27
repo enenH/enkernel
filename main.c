@@ -27,8 +27,10 @@
 #include "dfm_hwb.h"
 #include "udp_capture.h"
 #include "file_io.h"
+#include "fd_query.h"
 #include "sf_groups.h"
 #include "futex.h"
+#include "pte_bp.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DFM");
@@ -41,6 +43,14 @@ static long drv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     void __user *argp = (void __user *)arg;
 
     switch (cmd) {
+    case DFM_IOCTL_PTE_INFO:
+        return dfm_pte_info(argp);
+    case DFM_IOCTL_PTE_SET:
+        return dfm_pte_set(filp, argp);
+    case DFM_IOCTL_PTE_READ:
+        return dfm_pte_read(filp, argp);
+    case DFM_IOCTL_PTE_CLEAR:
+        return dfm_pte_clear(filp);
     case MEM_IOC_CAPABILITIES:
         return dfm_capabilities(argp);
     case MEM_IOC_FUTEX_WAITERS:
@@ -52,7 +62,7 @@ static long drv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     case UDP_IOC_READ_V2:
         return udp_capture_read_v2(argp);
     case MEM_IOC_OPEN_PROCESS_MEM:
-        return mem_open_process_mem(argp);
+        return mem_open_process_mem(filp, argp);
     case MEM_IOC_READ:
         return mem_read(argp);
     case MEM_IOC_READ_CACHE:
@@ -115,6 +125,8 @@ static long drv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         return udp_capture_stop();
     case DFM_FILE_IOC_READ:
         return dfm_file_read(argp);
+    case DFM_FILE_IOC_QUERY_FD:
+        return dfm_file_query_fd(argp);
     case DFM_FILE_IOC_WRITE:
         return dfm_file_write(argp);
     case DFM_CRED_IOC_ACQUIRE_SF_GROUPS:
@@ -128,6 +140,7 @@ static long drv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 static int drv_release(struct inode *inode, struct file *filp)
 {
+    dfm_pte_release(filp);
     dfm_futex_release(filp);
     dfm_hwb_release_owner(filp);
     udp_capture_stop();
@@ -326,6 +339,7 @@ static int __init mod_init(void)
 
 static void __exit mod_exit(void)
 {
+    dfm_pte_exit();
     syscall_cpu_clock_exit();
     kgsl_hide_exit();
     if (g_reboot_kprobe_registered) {

@@ -26,6 +26,11 @@ static_assert(sizeof(mem_query_signal_req) == 72U);
 static_assert(offsetof(mem_query_signal_req, out_alt_sp) == 48U);
 static_assert(offsetof(mem_query_mapping_req, out_phys_addr) == 16U);
 static_assert(sizeof(dfm_file_io_req) == 304U);
+static_assert(sizeof(dfm_file_query_req) == 120U);
+static_assert(offsetof(dfm_file_query_req, buf) == 16U);
+static_assert(offsetof(dfm_file_query_req, offset) == 32U);
+static_assert(offsetof(dfm_file_query_req, out_size) == 48U);
+static_assert(offsetof(dfm_file_query_req, reserved) == 104U);
 static_assert(sizeof(dfm_sf_groups_req) == 32U);
 
 namespace dfm {
@@ -387,6 +392,51 @@ namespace dfm {
         return true;
     }
 
+    long query_file(dfm_file_query_req& req) {
+        req.abi_version = DFM_FILE_QUERY_ABI_VERSION;
+        req.out_size = req.out_file_size = req.out_position = 0;
+        req.out_inode = req.out_device = req.out_mode = 0;
+        req.out_result = req.out_errno = 0;
+        if (g_fd < 0)
+            return -EBADF;
+        if (req.pid <= 0 || req.target_fd > INT32_MAX || req.flags ||
+            req.reserved[0] || req.reserved[1])
+            return -EINVAL;
+        switch (req.op) {
+        case DFM_FILE_QUERY_INFO:
+            if (req.offset || req.whence || req.buf || req.size)
+                return -EINVAL;
+            break;
+        case DFM_FILE_QUERY_PREAD:
+            if (req.offset < 0 || req.whence || !req.size)
+                return -EINVAL;
+            if (req.size > DFM_FILE_QUERY_MAX_READ)
+                return -E2BIG;
+            if (req.size > uint64_t(INT64_MAX) - uint64_t(req.offset))
+                return -EOVERFLOW;
+            if (!req.buf)
+                return -EFAULT;
+            break;
+        case DFM_FILE_QUERY_SEEK:
+            if (req.buf || req.size || req.whence > 4U)
+                return -EINVAL;
+            break;
+        default:
+            return -EINVAL;
+        }
+        const uint32_t op = req.op;
+        const long result = call_ioctl(g_fd, DFM_FILE_IOC_QUERY_FD, (long)&req);
+        if (result < 0)
+            return result;
+        if (result != 0 || req.abi_version != DFM_FILE_QUERY_ABI_VERSION ||
+            req.op != op || req.out_errno < 0 || req.out_errno > 4095 ||
+            req.out_size > req.size || req.out_result < 0 ||
+            (op != DFM_FILE_QUERY_PREAD && req.out_size) ||
+            (op != DFM_FILE_QUERY_SEEK && req.out_result))
+            return -EPROTO;
+        return 0;
+    }
+
     long query_kgsl(dfm_kgsl_query_req& req) {
         const uint32_t op = req.op;
         const uint32_t minId = req.min_id;
@@ -480,6 +530,45 @@ namespace dfm {
         g_last_ioctl_result =
             call_ioctl(g_fd, DFM_IOCTL_HWB_CLEAR, 0);
         return g_last_ioctl_result == 0;
+    }
+
+    long pte_info(dfm_pte_info_req& out) {
+        out = {};
+        if (g_fd < 0) return -EBADF;
+        dfm_pte_info_req req{};
+        req.abi_version = DFM_PTE_ABI_VERSION;
+        const long ret = call_ioctl(g_fd, DFM_IOCTL_PTE_INFO, (long)&req);
+        if (!ret) out = req;
+        return ret;
+    }
+
+    long pte_set(int pid, const uint64_t* addresses, size_t count) {
+        if (g_fd < 0) return -EBADF;
+        if (pid <= 0 || !addresses || !count || count > DFM_PTE_MAX_POINTS)
+            return -EINVAL;
+        dfm_pte_set_req req{};
+        req.abi_version = DFM_PTE_ABI_VERSION;
+        req.pid = pid;
+        req.point_count = static_cast<uint32_t>(count);
+        std::memcpy(req.addresses, addresses, count * sizeof(*addresses));
+        return call_ioctl(g_fd, DFM_IOCTL_PTE_SET, (long)&req);
+    }
+
+    long pte_read(dfm_pte_snapshot& out) {
+        out = {};
+        if (g_fd < 0) return -EBADF;
+        dfm_pte_read_req req{};
+        req.abi_version = DFM_PTE_ABI_VERSION;
+        req.buf = reinterpret_cast<uint64_t>(&out);
+        req.buf_size = sizeof(out);
+        const long ret = call_ioctl(g_fd, DFM_IOCTL_PTE_READ, (long)&req);
+        if (ret) out = {};
+        return ret;
+    }
+
+    long pte_clear() {
+        if (g_fd < 0) return -EBADF;
+        return call_ioctl(g_fd, DFM_IOCTL_PTE_CLEAR, 0);
     }
 
     bool udp_cap_init(int pid, uint16_t minPayload, uint16_t maxPayload) {

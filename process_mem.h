@@ -3,6 +3,7 @@
 
 #include <linux/types.h>
 
-long mem_open_process_mem(void __user *arg);
+struct file;
+long mem_open_process_mem(struct file *driver_file, void __user *arg);
 
 #endif

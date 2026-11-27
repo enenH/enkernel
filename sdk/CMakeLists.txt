@@ -16,7 +16,7 @@ option(ENKERNEL_BUILD_EXAMPLE "Build the SDK calling example" ON)
 # The kernel ABI is the only source of truth, including in installed SDKs.
 configure_file(../abi.h include/dfm/abi.h COPYONLY)
 
-add_library(enkernel_sdk STATIC src/driver.cpp src/loader.cpp)
+add_library(enkernel_sdk STATIC src/driver.cpp src/loader.cpp src/shared_ipc.cpp)
 add_library(enkernel::sdk ALIAS enkernel_sdk)
 set_target_properties(enkernel_sdk PROPERTIES
     EXPORT_NAME sdk
@@ -64,3 +64,6 @@ install(FILES
 install(DIRECTORY include/dfm DESTINATION include)
 install(FILES ../abi.h DESTINATION include/dfm)
 install(FILES examples/basic.cpp examples/CMakeLists.txt DESTINATION examples)
+install(FILES ../docs/shared-ipc.md ../docs/shared-ipc-validation.md
+    ../docs/pte-breakpoints.md
+    DESTINATION share/doc/enkernel)

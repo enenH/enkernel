@@ -72,11 +72,26 @@ namespace dfm {
      * No legacy caller-fd or userspace-system-call fallback. */
     long query_kgsl(dfm_kgsl_query_req& request);
 
+    /* Regular-file INFO/PREAD/SEEK through an existing target PID/FD. No local
+     * target fd, reopen, path proxy, process mutation or userspace fallback. The
+     * kernel pins one file per request and never changes its offset. SEEK only
+     * computes SET/CUR/END offsets; DATA/HOLE report EOPNOTSUPP. Return 0 requires
+     * checking positive out_errno; negative returns are infrastructure errors.
+     * See dfm_file_query_req for bounds, concurrency and SEEK_CUR semantics. */
+    long query_file(dfm_file_query_req& request);
+
     bool hwb_info(dfm_hwb_info_req& out);
     bool hwb_slots(int targetTid, dfm_hwb_slots_req& out);
     bool hwb_set(int targetTid, const dfm_hwb_point_req* points, size_t pointCount);
     bool hwb_read(dfm_hwb_snapshot& out);
     bool hwb_clear();
+    /* Persistent UXN execution tracing; negative errno, no fallback. CLEAR is
+     * idempotent. Only the file description that SET the session can read or
+     * clear it. See docs/pte-breakpoints.md for page/stepping restrictions. */
+    long pte_info(dfm_pte_info_req& out);
+    long pte_set(int pid, const uint64_t* addresses, size_t count);
+    long pte_read(dfm_pte_snapshot& out);
+    long pte_clear();
     /* Raw result of the most recent issued ioctl on this thread (negative errno).
      * Argument validation can fail before issuing an ioctl; do not rely on libc errno. */
     long last_ioctl_result();
@@ -112,6 +127,8 @@ namespace dfm {
     long query_access(int pid, uint64_t addr, mem_query_access_req& out);
     bool supports_process_mem();
     // Restricted system_server/libsensorservice session; caller owns out_fd.
+    // SystemUI uses a root-delegated driver fd and DFM_CAP_SENSOR_SYSTEMUI;
+    // a fresh dfm::init() from an unprivileged process does not grant this role.
     long open_process_mem(int pid, mem_open_process_mem_req& out);
     // Reuses QUERY_ACCESS on the session's bound mm, not a freshly resolved PID.
     long query_process_mem_access(int fd, int pid, uint64_t addr,
