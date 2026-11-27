@@ -2,8 +2,15 @@
 
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/capability.h>
+#include <linux/completion.h>
+#include <linux/jiffies.h>
+#include <linux/kallsyms.h>
 #include <linux/kprobes.h>
+#include <linux/mutex.h>
 #include <linux/ptrace.h>
+#include <linux/rcupdate.h>
+#include <linux/spinlock.h>
 #include <linux/version.h>
 #include <linux/anon_inodes.h>
 #include <linux/fdtable.h>
@@ -15,6 +22,7 @@
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/syscalls.h>
+#include <linux/workqueue.h>
 
 #include "abi.h"
 #include "install.h"
@@ -33,6 +41,45 @@
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DFM");
 MODULE_DESCRIPTION("DFM lab debug module");
+
+static DEFINE_SPINLOCK(g_install_lock);
+static bool g_accept_installs;
+static unsigned int g_install_users;
+static atomic_t g_driver_files = ATOMIC_INIT(0);
+
+static void set_install_admission(bool enabled)
+{
+    unsigned long flags;
+
+    spin_lock_irqsave(&g_install_lock, flags);
+    g_accept_installs = enabled;
+    spin_unlock_irqrestore(&g_install_lock, flags);
+}
+
+static bool install_try_get(void)
+{
+    unsigned long flags;
+    bool acquired;
+
+    spin_lock_irqsave(&g_install_lock, flags);
+    acquired = g_accept_installs &&
+               READ_ONCE(THIS_MODULE->state) == MODULE_STATE_LIVE &&
+               try_module_get(THIS_MODULE);
+    if (acquired)
+        g_install_users++;
+    spin_unlock_irqrestore(&g_install_lock, flags);
+    return acquired;
+}
+
+static void install_put(void)
+{
+    unsigned long flags;
+
+    module_put(THIS_MODULE);
+    spin_lock_irqsave(&g_install_lock, flags);
+    g_install_users--;
+    spin_unlock_irqrestore(&g_install_lock, flags);
+}
 
 /* ---- ioctl dispatcher ---- */
 
@@ -133,6 +180,7 @@ static int drv_release(struct inode *inode, struct file *filp)
     udp_capture_stop();
     touch_v2_release_all();
     touch_release_all();
+    atomic_dec(&g_driver_files);
     return 0;
 }
 
@@ -163,6 +211,7 @@ static int install_fd(void)
         return PTR_ERR(filp);
     }
 
+    atomic_inc(&g_driver_files);
     fd_install(fd, filp);
     return fd;
 }
@@ -173,6 +222,8 @@ int install_fd_to_user(int __user *outp)
 
     if (!outp)
         return -EFAULT;
+    if (!install_try_get())
+        return -ESHUTDOWN;
 
     fd = install_fd();
     if (copy_to_user(outp, &fd, sizeof(fd))) {
@@ -184,9 +235,10 @@ int install_fd_to_user(int __user *outp)
             ksys_close(fd);
 #endif
         }
-        return -EFAULT;
+        fd = -EFAULT;
     }
 
+    install_put();
     return fd < 0 ? fd : 0;
 }
 
@@ -202,9 +254,11 @@ static void install_fd_tw_func(struct callback_head *cb)
     struct install_tw *tw =
         container_of(cb, struct install_tw, cb);
 
-    install_fd_to_user(tw->outp);
+    if (!(current->flags & PF_EXITING))
+        install_fd_to_user(tw->outp);
 
     kfree(tw);
+    install_put();
 }
 
 /* ---- reboot kprobe handler ---- */
@@ -227,15 +281,20 @@ static int reboot_handler_pre(struct kprobe *p, struct pt_regs *regs)
 
     arg4 = (unsigned long)real_regs->regs[3];
 
-    tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
-    if (!tw)
+    if (!arg4 || !install_try_get())
         return 0;
+    tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+    if (!tw) {
+        install_put();
+        return 0;
+    }
 
     tw->outp = (int __user *)arg4;
     tw->cb.func = install_fd_tw_func;
 
     if (task_work_add(current, &tw->cb, TWA_RESUME)) {
         kfree(tw);
+        install_put();
         pr_warn("task_work_add failed\n");
     }
 
@@ -246,6 +305,149 @@ static struct kprobe kp_reboot = {
     .symbol_name = "__arm64_sys_reboot",
     .pre_handler = reboot_handler_pre,
 };
+
+#if defined(CONFIG_MODULE_UNLOAD) && defined(CONFIG_SYSFS) && defined(CONFIG_TASKS_RCU)
+
+static DEFINE_MUTEX(g_unload_lock);
+static DECLARE_COMPLETION(g_unload_done);
+static bool g_unload_work_queued;
+static bool g_unload_started;
+static bool g_unload_prepared;
+static int g_unload_result;
+
+static int stop_new_installs(void)
+{
+    unsigned long flags;
+    bool was_accepting;
+
+    spin_lock_irqsave(&g_install_lock, flags);
+    if (g_install_users || atomic_read(&g_driver_files)) {
+        spin_unlock_irqrestore(&g_install_lock, flags);
+        return -EBUSY;
+    }
+    was_accepting = g_accept_installs;
+    g_accept_installs = false;
+    spin_unlock_irqrestore(&g_install_lock, flags);
+
+    if (!process_mem_in_use() && !touch_v2_has_pending_events())
+        return 0;
+
+    /* An existing session or an input release still needs to finish. */
+    set_install_admission(was_accepting);
+    return -EBUSY;
+}
+
+static void prepare_unload_workfn(struct work_struct *work)
+{
+    int ret;
+
+    ret = touch_quiesce_read_hook();
+    if (ret)
+        goto done;
+    g_unload_started = true;
+    ret = dfm_hwb_clear();
+    if (!ret)
+        ret = syscall_cpu_clock_exit();
+    if (!ret)
+        ret = syscall_hook_exit();
+    if (!ret && g_reboot_kprobe_registered) {
+        unregister_kprobe(&kp_reboot);
+        g_reboot_kprobe_registered = 0;
+        /* Pending task work pins the module. Drain the return instructions
+         * of callbacks that just dropped their references. */
+        synchronize_rcu_tasks();
+    }
+done:
+    if (ret)
+        pr_warn("unload preparation failed: %d\n", ret);
+    g_unload_result = ret;
+    complete(&g_unload_done);
+}
+
+static DECLARE_WORK(g_unload_work, prepare_unload_workfn);
+
+static int prepare_unload_set(const char *value, const struct kernel_param *param)
+{
+    const int *modules_disabled;
+    bool requested;
+    long waited;
+    int ret;
+
+    if (kstrtobool(value, &requested) || !requested)
+        return -EINVAL;
+    if (!capable(CAP_SYS_MODULE))
+        return -EPERM;
+    modules_disabled = (const int *)kallsyms_lookup_name("modules_disabled");
+    if (modules_disabled && READ_ONCE(*modules_disabled))
+        return -EPERM;
+    if (READ_ONCE(THIS_MODULE->state) != MODULE_STATE_LIVE)
+        return -EBUSY;
+
+    mutex_lock(&g_unload_lock);
+    ret = 0;
+    if (g_unload_prepared)
+        goto out;
+    if (!g_unload_work_queued) {
+        ret = stop_new_installs();
+        if (ret)
+            goto out;
+        reinit_completion(&g_unload_done);
+        g_unload_work_queued = true;
+        queue_work(system_unbound_wq, &g_unload_work);
+    }
+
+    /* A sleeping hook can delay a grace period. If that happens, leave the
+     * lifetime pin in place and let a later request collect the result. */
+    waited = wait_for_completion_killable_timeout(&g_unload_done,
+                                                  msecs_to_jiffies(10000));
+    if (waited <= 0) {
+        ret = waited ? (int)waited : -ETIMEDOUT;
+        goto out;
+    }
+    flush_work(&g_unload_work);
+    g_unload_work_queued = false;
+    ret = g_unload_result;
+    if (!ret) {
+        g_unload_prepared = true;
+        module_put(THIS_MODULE);
+    } else if (!g_unload_started) {
+        /* A still-open touch proxy can keep serving existing clients. */
+        set_install_admission(true);
+    }
+out:
+    mutex_unlock(&g_unload_lock);
+    return ret;
+}
+
+static int prepare_unload_get(char *buf, const struct kernel_param *param)
+{
+    unsigned long flags;
+    bool preparing;
+
+    spin_lock_irqsave(&g_install_lock, flags);
+    preparing = !g_accept_installs &&
+                READ_ONCE(THIS_MODULE->state) == MODULE_STATE_LIVE;
+    spin_unlock_irqrestore(&g_install_lock, flags);
+    return sprintf(buf, "%c\n", preparing ? 'Y' : 'N');
+}
+
+static int unload_supported_get(char *buf, const struct kernel_param *param)
+{
+    return sprintf(buf, "Y\n");
+}
+
+static const struct kernel_param_ops prepare_unload_ops = {
+    .set = prepare_unload_set,
+    .get = prepare_unload_get,
+};
+static const struct kernel_param_ops unload_supported_ops = {
+    .get = unload_supported_get,
+};
+
+module_param_cb(prepare_unload, &prepare_unload_ops, NULL, 0600);
+module_param_cb(unload_supported, &unload_supported_ops, NULL, 0444);
+
+#endif
 
 /* ---- module init/exit ---- */
 
@@ -294,7 +496,11 @@ static int __init mod_init(void)
     if (syscall_ret < 0)
         pr_warn("syscall install hook unavailable: %d\n", syscall_ret);
 
-    reboot_ret = register_kprobe(&kp_reboot);
+    /* Queued install callbacks must have a Tasks RCU return grace period
+     * on kernels that allow module removal. */
+    reboot_ret = -EOPNOTSUPP;
+    if (!IS_ENABLED(CONFIG_MODULE_UNLOAD) || IS_ENABLED(CONFIG_TASKS_RCU))
+        reboot_ret = register_kprobe(&kp_reboot);
     if (reboot_ret < 0) {
         pr_warn("failed to register kprobe on reboot: %d\n", reboot_ret);
     } else {
@@ -303,7 +509,6 @@ static int __init mod_init(void)
 
     if (syscall_ret < 0 && reboot_ret < 0) {
         pr_err("no fd install entry registered\n");
-        syscall_hook_exit();
         dfm_file_io_exit();
         mem_core_exit();
         return reboot_ret;
@@ -317,7 +522,10 @@ static int __init mod_init(void)
 
     remove_inte_proc_entries();
 
-    kobject_del(&THIS_MODULE->mkobj.kobj);
+    /* Kernel-managed sysfs stays available for unload preparation. Hold a
+     * reference until preparation has restored and drained external hooks. */
+    __module_get(THIS_MODULE);
+    set_install_admission(true);
 
     pr_info("module loaded, syscall_nr=%d reboot_fallback=%d\n",
             syscall_hook_nr(), g_reboot_kprobe_registered);
@@ -326,13 +534,9 @@ static int __init mod_init(void)
 
 static void __exit mod_exit(void)
 {
-    syscall_cpu_clock_exit();
+    /* The preparation pin permits entry only after all detachable hooks
+     * that can fail to restore have been drained. */
     kgsl_hide_exit();
-    if (g_reboot_kprobe_registered) {
-        unregister_kprobe(&kp_reboot);
-        g_reboot_kprobe_registered = 0;
-    }
-    syscall_hook_exit();
     udp_capture_exit();
     dfm_hwb_exit();
     touch_v2_release_all();

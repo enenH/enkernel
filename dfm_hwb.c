@@ -21,6 +21,7 @@
 
 #include <linux/bitmap.h>
 #include <linux/build_bug.h>
+#include <linux/cpu.h>
 #include <linux/cpumask.h>
 #include <linux/errno.h>
 #include <linux/file.h>
@@ -28,6 +29,7 @@
 #include <linux/kallsyms.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
+#include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/perf_event.h>
 #include <linux/pid.h>
@@ -93,6 +95,7 @@ struct dfm_hwb_session {
 static DEFINE_MUTEX(g_hwb_mutex);
 static DEFINE_SPINLOCK(g_hwb_lock);
 static struct dfm_hwb_session g_hwb;
+static bool g_hwb_cleanup_pinned;
 static atomic_t g_hwb_finish_returns_inflight = ATOMIC_INIT(0);
 static DECLARE_WAIT_QUEUE_HEAD(g_hwb_finish_return_wait);
 
@@ -769,15 +772,11 @@ static int dfm_hwb_hook_install_one(struct dfm_hwb_hook_entry *entry)
     dfm_hwb_make_ldr_ret((uint64_t)entry->trampoline, hook_code);
     ret = dfm_hwb_patch_words((uint32_t *)(uintptr_t)entry->target_addr,
                               hook_code, DFM_HOOK_STUB_WORDS);
-    if (ret)
-        goto out_restore;
-
+    /* Even a failed patch may have changed part of the entry. Keep the
+     * trampoline reserved until the original instructions are restored. */
     entry->installed = 1;
-    return 0;
+    return ret;
 
-out_restore:
-    dfm_hwb_patch_words((uint32_t *)(uintptr_t)entry->target_addr,
-                        entry->saved_insn, DFM_HOOK_STUB_WORDS);
 out_slot:
     dfm_hwb_slot_free(slot);
     entry->slot_index = -1;
@@ -785,17 +784,24 @@ out_slot:
     return ret;
 }
 
-static void dfm_hwb_hook_remove_one(struct dfm_hwb_hook_entry *entry)
+static int dfm_hwb_hook_remove_one(struct dfm_hwb_hook_entry *entry)
 {
-    if (!entry->installed)
-        return;
+    int ret;
 
-    dfm_hwb_patch_words((uint32_t *)(uintptr_t)entry->target_addr,
-                        entry->saved_insn, DFM_HOOK_STUB_WORDS);
+    if (!entry->installed)
+        return 0;
+
+    ret = dfm_hwb_patch_words((uint32_t *)(uintptr_t)entry->target_addr,
+                              entry->saved_insn, DFM_HOOK_STUB_WORDS);
+    if (ret)
+        return ret;
+    /* Drain nonpreemptible entries before reusing the trampoline. */
+    synchronize_rcu();
     dfm_hwb_slot_free(entry->slot_index);
     entry->slot_index = -1;
     entry->trampoline = NULL;
     entry->installed = 0;
+    return 0;
 }
 
 static int dfm_hwb_hook_install_many(struct dfm_hwb_hook_entry *entries, int count)
@@ -805,21 +811,22 @@ static int dfm_hwb_hook_install_many(struct dfm_hwb_hook_entry *entries, int cou
 
     for (i = 0; i < count; i++) {
         ret = dfm_hwb_hook_install_one(&entries[i]);
-        if (ret) {
-            while (--i >= 0)
-                dfm_hwb_hook_remove_one(&entries[i]);
+        if (ret)
             return ret;
-        }
     }
     return 0;
 }
 
-static void dfm_hwb_hook_remove_many(struct dfm_hwb_hook_entry *entries, int count)
+static int dfm_hwb_hook_remove_many(struct dfm_hwb_hook_entry *entries, int count)
 {
-    int i;
+    int i, ret, first_error = 0;
 
-    for (i = count - 1; i >= 0; i--)
-        dfm_hwb_hook_remove_one(&entries[i]);
+    for (i = count - 1; i >= 0; i--) {
+        ret = dfm_hwb_hook_remove_one(&entries[i]);
+        if (ret && !first_error)
+            first_error = ret;
+    }
+    return first_error;
 }
 
 #define DFM_HWB_HOOK(sym, fn)               \
@@ -1643,47 +1650,57 @@ static int dfm_hwb_hooks_install_locked(void)
     if (g_hwb.hooks_installed)
         return 0;
 
+    /* The caller tears down all published entries on a partial install. */
+    g_hwb.hooks_installed = 1;
     ret = dfm_hwb_hook_install_many(g_hwb_exception_hooks,
                                     ARRAY_SIZE(g_hwb_exception_hooks));
     if (ret)
         return ret;
 
-    ret = dfm_hwb_hook_install_many(g_hwb_finish_hooks,
-                                    ARRAY_SIZE(g_hwb_finish_hooks));
-    if (ret) {
-        dfm_hwb_hook_remove_many(g_hwb_exception_hooks,
-                                 ARRAY_SIZE(g_hwb_exception_hooks));
-        return ret;
-    }
-
-    g_hwb.hooks_installed = 1;
-    return 0;
+    return dfm_hwb_hook_install_many(g_hwb_finish_hooks,
+                                     ARRAY_SIZE(g_hwb_finish_hooks));
 }
 
-static void dfm_hwb_hooks_remove_locked(void)
+static int dfm_hwb_hooks_remove_locked(void)
 {
-    if (!g_hwb.hooks_installed)
-        return;
+    int ret, exception_ret;
 
-    dfm_hwb_hook_remove_many(g_hwb_finish_hooks, ARRAY_SIZE(g_hwb_finish_hooks));
+    if (!g_hwb.hooks_installed)
+        return 0;
+
+    ret = dfm_hwb_hook_remove_many(g_hwb_finish_hooks, ARRAY_SIZE(g_hwb_finish_hooks));
     /*
      * finish_task_switch() runs before __schedule() reenables preemption.
-     * The grace period drains CPUs that entered the patched entry before it
-     * was restored; the counter then drains every redirected return frame.
+     * Wait for redirected returns and cover the assembly epilogue after
+     * its counter reaches zero.
      */
-    synchronize_rcu();
-    wait_event(g_hwb_finish_return_wait,
-               atomic_read(&g_hwb_finish_returns_inflight) == 0);
-    dfm_hwb_hook_remove_many(g_hwb_exception_hooks,
-                             ARRAY_SIZE(g_hwb_exception_hooks));
-    g_hwb.hooks_installed = 0;
+    if (!ret) {
+        wait_event(g_hwb_finish_return_wait,
+                   atomic_read(&g_hwb_finish_returns_inflight) == 0);
+        synchronize_rcu();
+    }
+    exception_ret = dfm_hwb_hook_remove_many(g_hwb_exception_hooks,
+                                             ARRAY_SIZE(g_hwb_exception_hooks));
+    if (!ret)
+        ret = exception_ret;
+    g_hwb.hooks_installed = ret != 0;
+    if (ret && !g_hwb_cleanup_pinned) {
+        /* The session file can close even if a hook remains reachable. */
+        __module_get(THIS_MODULE);
+        g_hwb_cleanup_pinned = true;
+        pr_err("dfm: hardware breakpoint cleanup failed: %d\n", ret);
+    } else if (!ret && g_hwb_cleanup_pinned) {
+        g_hwb_cleanup_pinned = false;
+        module_put(THIS_MODULE);
+    }
+    return ret;
 }
 
-static void dfm_hwb_stop_locked(void)
+static int dfm_hwb_stop_locked(void)
 {
     struct dfm_hwb_cpu_clear_arg arg;
     unsigned long flags;
-    int cpu;
+    int ret;
 
     spin_lock_irqsave(&g_hwb_lock, flags);
     g_hwb.generation++;
@@ -1696,11 +1713,12 @@ static void dfm_hwb_stop_locked(void)
     spin_unlock_irqrestore(&g_hwb_lock, flags);
 
     if (arg.used_brps || arg.used_wrps) {
-        for_each_online_cpu(cpu)
-            smp_call_function_single(cpu, dfm_hwb_clear_cpu_cb, &arg, 1);
+        cpus_read_lock();
+        on_each_cpu(dfm_hwb_clear_cpu_cb, &arg, 1);
+        cpus_read_unlock();
     }
 
-    dfm_hwb_hooks_remove_locked();
+    ret = dfm_hwb_hooks_remove_locked();
 
     spin_lock_irqsave(&g_hwb_lock, flags);
     g_hwb.target_tid = 0;
@@ -1710,6 +1728,7 @@ static void dfm_hwb_stop_locked(void)
     g_hwb.used_wrps = 0;
     memset(g_hwb.points, 0, sizeof(g_hwb.points));
     spin_unlock_irqrestore(&g_hwb_lock, flags);
+    return ret;
 }
 
 long dfm_hwb_info(void __user *arg)
@@ -1821,15 +1840,19 @@ long dfm_hwb_set(struct file *owner, void __user *arg)
 
     mutex_lock(&g_hwb_mutex);
 
-    dfm_hwb_stop_locked();
+    ret = dfm_hwb_stop_locked();
+    if (ret)
+        goto out_unlock;
 
     ret = dfm_hwb_alloc_snapshots_locked();
     if (ret)
         goto out_unlock;
 
     ret = dfm_hwb_hooks_install_locked();
-    if (ret)
+    if (ret) {
+        dfm_hwb_stop_locked();
         goto out_unlock;
+    }
 
     spin_lock_irqsave(&g_hwb_lock, flags);
     g_hwb.target_tid = req.target_tid;
@@ -1848,8 +1871,6 @@ long dfm_hwb_set(struct file *owner, void __user *arg)
     on_each_cpu(dfm_hwb_refresh_cpu_cb, &req.target_tid, 1);
 
 out_unlock:
-    if (ret)
-        dfm_hwb_stop_locked();
     mutex_unlock(&g_hwb_mutex);
     return ret;
 }
@@ -1904,14 +1925,16 @@ out_unlock:
 
 long dfm_hwb_clear(void)
 {
+    int ret;
+
     mutex_lock(&g_hwb_mutex);
-    dfm_hwb_stop_locked();
+    ret = dfm_hwb_stop_locked();
     if (g_hwb.snapshots[0])
         memset(g_hwb.snapshots[0], 0, sizeof(struct dfm_hwb_snapshot));
     if (g_hwb.snapshots[1])
         memset(g_hwb.snapshots[1], 0, sizeof(struct dfm_hwb_snapshot));
     mutex_unlock(&g_hwb_mutex);
-    return 0;
+    return ret;
 }
 
 void dfm_hwb_release_owner(struct file *owner)

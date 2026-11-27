@@ -10,7 +10,6 @@
 #include <linux/compiler.h>
 #include <linux/cpumask.h>
 #include <linux/cred.h>
-#include <linux/delay.h>
 #include <linux/errno.h>
 #include <linux/kallsyms.h>
 #include <linux/kernel.h>
@@ -43,11 +42,17 @@
 #define __nocfi
 #endif
 
+/* Table readers may sleep in a handler and retain its address across
+ * preemption. Detach uses both Tasks RCU and SRCU. */
+#if defined(CONFIG_TASKS_RCU) && \
+    (defined(CONFIG_SRCU) || defined(CONFIG_TREE_SRCU) || defined(CONFIG_TINY_SRCU))
+
 typedef asmlinkage long (*syscall_fn_t)(const struct pt_regs *regs);
 
 static syscall_fn_t *g_sys_call_table;
 static syscall_fn_t g_orig_syscall;
 static int g_hooked_nr = -1;
+static struct srcu_struct g_install_srcu;
 
 static void *syscall_lookup_symbol(const char *symbol_name)
 {
@@ -200,19 +205,22 @@ static int syscall_patch_text_expected(void *dst, const void *src,
     return stop_machine(syscall_patch_text_cb, &info, cpu_online_mask);
 }
 
-static int syscall_patch_text(void *dst, const void *src, size_t len)
+static int syscall_restore_hook(syscall_fn_t *slot, syscall_fn_t original,
+                                syscall_fn_t replacement)
 {
-    return syscall_patch_text_expected(dst, src, NULL, len);
+    if (READ_ONCE(*slot) == original)
+        return 0;
+    return syscall_patch_text_expected(slot, &original, &replacement,
+                                       sizeof(original));
 }
 
-static int syscall_patch_table(int nr, syscall_fn_t fn)
+static void syscall_drain_hook(struct srcu_struct *srcu)
 {
-    if (!g_sys_call_table)
-        return -ENOENT;
-    if (nr < 0 || nr >= __NR_syscalls)
-        return -EINVAL;
-
-    return syscall_patch_text(&g_sys_call_table[nr], &fn, sizeof(fn));
+    /* Cover a stale dispatch before it enters SRCU, sleeping handlers, and
+     * the instructions that return to the caller after srcu_read_unlock(). */
+    synchronize_rcu_tasks();
+    synchronize_srcu(srcu);
+    synchronize_rcu_tasks();
 }
 
 static asmlinkage long __nocfi syscall_install_handler(const struct pt_regs *regs)
@@ -220,17 +228,23 @@ static asmlinkage long __nocfi syscall_install_handler(const struct pt_regs *reg
     int magic1;
     int magic2;
     int __user *outp;
+    long ret = -ENOSYS;
+    int idx;
 
+    idx = srcu_read_lock(&g_install_srcu);
     if (!regs || current_uid().val > 1000)
-        return -ENOSYS;
+        goto out;
 
     magic1 = (int)regs->regs[0];
     magic2 = (int)regs->regs[1];
     if (magic1 != INSTALL_MAGIC1 || magic2 != INSTALL_MAGIC2)
-        return -ENOSYS;
+        goto out;
 
     outp = (int __user *)(unsigned long)regs->regs[3];
-    return install_fd_to_user(outp);
+    ret = install_fd_to_user(outp);
+out:
+    srcu_read_unlock(&g_install_srcu, idx);
+    return ret;
 }
 
 static syscall_fn_t syscall_lookup_ni(void)
@@ -247,6 +261,7 @@ static syscall_fn_t syscall_lookup_ni(void)
 int syscall_hook_init(void)
 {
     syscall_fn_t ni_syscall;
+    syscall_fn_t replacement = syscall_install_handler;
     int i;
     int ret;
     int install_ret = -ENOENT;
@@ -261,13 +276,17 @@ int syscall_hook_init(void)
     ni_syscall = syscall_lookup_ni();
     if (!ni_syscall)
         return -ENOENT;
+    ret = init_srcu_struct(&g_install_srcu);
+    if (ret)
+        return ret;
 
     for (i = 0; i < __NR_syscalls; i++) {
         if (READ_ONCE(g_sys_call_table[i]) != ni_syscall)
             continue;
 
-        ret = syscall_patch_table(i, syscall_install_handler);
-        if (ret) {
+        ret = syscall_patch_text_expected(&g_sys_call_table[i], &replacement,
+                                          &ni_syscall, sizeof(replacement));
+        if (ret && READ_ONCE(g_sys_call_table[i]) != replacement) {
             install_ret = ret;
             continue;
         }
@@ -278,39 +297,32 @@ int syscall_hook_init(void)
         return 0;
     }
 
+    cleanup_srcu_struct(&g_install_srcu);
     return install_ret;
 }
 
-void syscall_hook_exit(void)
+int syscall_hook_exit(void)
 {
     int ret;
 
-    if (!g_sys_call_table)
-        return;
-
-    if (g_hooked_nr >= 0 && g_orig_syscall) {
-        ret = syscall_patch_table(g_hooked_nr, g_orig_syscall);
-        if (ret)
-            pr_err("failed to restore syscall nr %d: %d\n", g_hooked_nr, ret);
-        else
-            pr_info("syscall install hook restored nr %d\n", g_hooked_nr);
-    }
-
+    if (g_hooked_nr < 0)
+        return 0;
+    ret = syscall_restore_hook(&g_sys_call_table[g_hooked_nr], g_orig_syscall,
+                               syscall_install_handler);
+    if (ret)
+        return ret;
+    syscall_drain_hook(&g_install_srcu);
+    cleanup_srcu_struct(&g_install_srcu);
+    pr_info("syscall install hook restored nr %d\n", g_hooked_nr);
     g_hooked_nr = -1;
     g_orig_syscall = NULL;
+    return 0;
 }
 
 int syscall_hook_nr(void)
 {
     return g_hooked_nr;
 }
-
-/* A syscall-table reader may have fetched our address before restoration,
- * and copy_to_user() can sleep. Both Tasks RCU and SRCU are required for
- * teardown; ordinary RCU alone does not protect this call path.
- * Newer kernels removed CONFIG_SRCU while retaining TREE_SRCU/TINY_SRCU. */
-#if defined(CONFIG_TASKS_RCU) && \
-    (defined(CONFIG_SRCU) || defined(CONFIG_TREE_SRCU) || defined(CONFIG_TINY_SRCU))
 
 typedef int (*cpu_clock_get_fn_t)(clockid_t clock, struct timespec64 *ts);
 
@@ -497,20 +509,10 @@ static asmlinkage long __nocfi cpu_clock_compat64(const struct pt_regs *regs)
 }
 #endif
 
-static void cpu_clock_drain(void)
-{
-    /* First catch calls that fetched the old table entry but have not yet
-     * entered SRCU. Then wait for even sleeping handlers; finally cover
-     * their instructions after srcu_read_unlock() and wrapper epilogues. */
-    synchronize_rcu_tasks();
-    synchronize_srcu(&g_cpu_clock_srcu);
-    synchronize_rcu_tasks();
-}
-
-static void cpu_clock_remove_hooks(void)
+static int cpu_clock_remove_hooks(void)
 {
     unsigned int i = g_cpu_clock_hook_count;
-    bool drain = false;
+    int first_error = 0;
 
     while (i) {
         struct cpu_clock_hook *hook = &g_cpu_clock_hooks[--i];
@@ -518,26 +520,16 @@ static void cpu_clock_remove_hooks(void)
 
         if (!hook->installed)
             continue;
-        drain = true;
-        /* A void module-exit callback cannot reject unload. Never let it
-         * free executable code while the table still references it. Retry
-         * failed restores, without overwriting another owner's table hook. */
-        for (;;) {
-            if (READ_ONCE(*hook->slot) == hook->original)
-                break;
-            ret = syscall_patch_text_expected(hook->slot, &hook->original,
-                                              &hook->replacement,
-                                              sizeof(hook->original));
-            if (!ret)
-                break;
-            pr_err_ratelimited("CPU clock hook restore failed: %d; waiting for safe detach\n",
-                               ret);
-            msleep(20);
+        ret = syscall_restore_hook(hook->slot, hook->original,
+                                   hook->replacement);
+        if (ret) {
+            if (!first_error)
+                first_error = ret;
+            continue;
         }
         hook->installed = false;
     }
-    if (drain)
-        cpu_clock_drain();
+    return first_error;
 }
 
 int syscall_cpu_clock_init(void)
@@ -608,9 +600,13 @@ int syscall_cpu_clock_init(void)
          * that our handler has become reachable. */
         hook->installed = !ret || READ_ONCE(*hook->slot) == hook->replacement;
         if (ret) {
-            cpu_clock_remove_hooks();
-            cleanup_srcu_struct(&g_cpu_clock_srcu);
-            g_cpu_clock_srcu_ready = false;
+            int restore_ret = cpu_clock_remove_hooks();
+
+            if (restore_ret)
+                pr_warn("partial CPU-clock hook restore failed: %d\n",
+                        restore_ret);
+            /* Unload preparation drains any dispatch that still has our
+             * address before freeing SRCU or the module. */
             goto out_status;
         }
     }
@@ -677,35 +673,57 @@ out:
     return ret;
 }
 
-void syscall_cpu_clock_exit(void)
+int syscall_cpu_clock_exit(void)
 {
     struct pid *old;
+    int ret;
 
     mutex_lock(&g_cpu_clock_mutex);
     g_cpu_clock_status = -ESHUTDOWN;
+    ret = cpu_clock_remove_hooks();
+    if (ret)
+        goto out;
     old = rcu_dereference_protected(g_cpu_clock_target,
                                     lockdep_is_held(&g_cpu_clock_mutex));
     rcu_assign_pointer(g_cpu_clock_target, NULL);
-    cpu_clock_remove_hooks();
-    synchronize_rcu();
-    put_pid(old);
     if (g_cpu_clock_srcu_ready) {
+        syscall_drain_hook(&g_cpu_clock_srcu);
         cleanup_srcu_struct(&g_cpu_clock_srcu);
         g_cpu_clock_srcu_ready = false;
     }
+    synchronize_rcu();
+    put_pid(old);
     g_cpu_clock_get = NULL;
+out:
     mutex_unlock(&g_cpu_clock_mutex);
+    return ret;
 }
 
 #else
+
+int syscall_hook_init(void)
+{
+    return -EOPNOTSUPP;
+}
+
+int syscall_hook_exit(void)
+{
+    return 0;
+}
+
+int syscall_hook_nr(void)
+{
+    return -1;
+}
 
 int syscall_cpu_clock_init(void)
 {
     return -EOPNOTSUPP;
 }
 
-void syscall_cpu_clock_exit(void)
+int syscall_cpu_clock_exit(void)
 {
+    return 0;
 }
 
 long syscall_cpu_clock_set_target(void __user *arg)

@@ -7,14 +7,22 @@
 #include <linux/init_task.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
+#include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/uidgid.h>
+#include <linux/version.h>
 
 #include "abi.h"
 #include "file_io.h"
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");
+#else
+MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
+#endif
 
 #define DFM_FILE_ROOT "/data/adb"
 #define DFM_FILE_PREFIX DFM_FILE_ROOT "/"

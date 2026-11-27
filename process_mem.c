@@ -49,6 +49,16 @@ static DEFINE_MUTEX(session_lock);
 /* Both launch modes must serialize ownership of the system-wide GOT slot. */
 static struct process_mem_session *active_session;
 
+bool process_mem_in_use(void)
+{
+    bool busy;
+
+    mutex_lock(&session_lock);
+    busy = active_session != NULL;
+    mutex_unlock(&session_lock);
+    return busy;
+}
+
 static bool caller_allowed(void)
 {
     const struct cred *cred = current_cred();

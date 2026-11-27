@@ -274,6 +274,17 @@ void touch_v2_release_all(void)
     spin_unlock_irqrestore(&g_touch_v2_pool_lock, flags);
 }
 
+bool touch_v2_has_pending_events(void)
+{
+    unsigned long flags;
+    bool pending;
+
+    spin_lock_irqsave(&g_touch_v2_pool_lock, flags);
+    pending = g_touch_v2_event_count != 0;
+    spin_unlock_irqrestore(&g_touch_v2_pool_lock, flags);
+    return pending;
+}
+
 void touch_v2_exit(void)
 {
     unsigned long flags;

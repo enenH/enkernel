@@ -4,5 +4,6 @@
 #include <linux/types.h>
 
 long mem_open_process_mem(void __user *arg);
+bool process_mem_in_use(void);
 
 #endif

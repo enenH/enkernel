@@ -7,10 +7,12 @@
 #include <linux/file.h>
 #include <linux/input.h>
 #include <linux/kprobes.h>
+#include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/namei.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
@@ -105,15 +107,17 @@ struct touch_device_caps {
 };
 
 static DEFINE_MUTEX(g_touch_lock);
+static DEFINE_MUTEX(g_touch_read_lock);
+static DEFINE_MUTEX(g_touch_hook_lock);
+static DEFINE_SPINLOCK(g_touch_binding_lock);
 static struct touch_slot_state g_touch_slots[TOUCH_MAX_SLOTS];
 static int g_touch_current_slot;
 static bool g_touch_slots_initialized;
 static struct input_dev *g_touch_input_dev;
 static struct touch_device_caps g_touch_device_caps;
 static ssize_t (*g_touch_orig_read)(struct file *, char __user *, size_t, loff_t *);
+static const struct file_operations *g_touch_original_fops;
 static struct file_operations g_touch_proxy_fops;
-static struct work_struct g_touch_stop_read_work;
-static bool g_touch_stop_work_initialized;
 static bool g_touch_read_hook_registered;
 static bool g_touch_proxy_installed;
 static struct input_event g_touch_read_events[TOUCH_MAX_EVENTS];
@@ -252,33 +256,28 @@ static ssize_t touch_read_proxy(struct file *file, char __user *buf,
     if (!client || !g_touch_orig_read)
         return -EINVAL;
 
-    mutex_lock(&g_touch_lock);
-    touch_init_slots_locked();
-
-    if (!g_touch_input_dev)
-        g_touch_input_dev = client->evdev->handle.dev;
-
+    /* Keep readers ordered without blocking driver release behind an
+     * input read or a user copy. */
+    mutex_lock(&g_touch_read_lock);
     ret = g_touch_orig_read(file, buf, count, pos);
-    if (ret <= 0 || (ret % sizeof(struct input_event)) != 0) {
-        mutex_unlock(&g_touch_lock);
-        return ret;
-    }
+    if (ret <= 0 || (ret % sizeof(struct input_event)) != 0)
+        goto out_read;
 
     num_events = ret / sizeof(struct input_event);
-    if (num_events > TOUCH_MAX_EVENTS) {
-        mutex_unlock(&g_touch_lock);
-        return ret;
-    }
+    if (num_events > TOUCH_MAX_EVENTS)
+        goto out_read;
 
     copy_size = (size_t)ret;
     memset(g_touch_read_events, 0, sizeof(g_touch_read_events));
     memset(&g_touch_final_events, 0, sizeof(g_touch_final_events));
 
     if (copy_from_user(g_touch_read_events, buf, copy_size)) {
-        mutex_unlock(&g_touch_lock);
-        return -EFAULT;
+        ret = -EFAULT;
+        goto out_read;
     }
 
+    mutex_lock(&g_touch_lock);
+    touch_init_slots_locked();
     current_slot = g_touch_current_slot;
     for (i = 0; i < num_events; ++i) {
         struct input_event *event = &g_touch_read_events[i];
@@ -396,13 +395,31 @@ static ssize_t touch_read_proxy(struct file *file, char __user *buf,
     copy_size = (size_t)g_touch_final_events.count * sizeof(struct input_event);
     mutex_unlock(&g_touch_lock);
 
-    if (copy_to_user(buf, g_touch_final_events.events, copy_size))
-        return -EFAULT;
-
-    return (ssize_t)copy_size;
+    ret = copy_to_user(buf, g_touch_final_events.events, copy_size)
+        ? -EFAULT : (ssize_t)copy_size;
+out_read:
+    mutex_unlock(&g_touch_read_lock);
+    return ret;
 }
 
 static struct kprobe g_touch_read_kprobe;
+
+static int touch_proxy_release(struct inode *inode, struct file *file)
+{
+    const struct file_operations *original = g_touch_original_fops;
+    int ret = 0;
+
+    mutex_lock(&g_touch_lock);
+    g_touch_input_dev = NULL;
+    g_touch_status.installed = 0;
+    mutex_unlock(&g_touch_lock);
+    if (original->release)
+        ret = original->release(inode, file);
+    /* Keep the original file's ownership reference until its release runs.
+     * The VFS drops the proxy's separate reference after we return. */
+    fops_put(original);
+    return ret;
+}
 
 static void touch_unregister_read_hook_now(void)
 {
@@ -415,16 +432,12 @@ static void touch_unregister_read_hook_now(void)
 
 static void touch_stop_read_workfn(struct work_struct *work)
 {
+    mutex_lock(&g_touch_hook_lock);
     touch_unregister_read_hook_now();
+    mutex_unlock(&g_touch_hook_lock);
 }
 
-static void touch_stop_read_hook(void)
-{
-    if (!g_touch_stop_work_initialized)
-        return;
-
-    schedule_work(&g_touch_stop_read_work);
-}
+static DECLARE_WORK(g_touch_stop_read_work, touch_stop_read_workfn);
 
 /* Reject-reason codes mirrored in struct touch_status.last_reject_reason.
  * Keep 0=none / 1..N=reasons stable — user side compares by number. */
@@ -472,6 +485,8 @@ static int touch_try_patch_file(struct file *file)
     struct evdev_client *client;
     struct evdev *evdev;
     struct input_dev *idev;
+    const struct file_operations *original;
+    unsigned long flags;
     char leader[TASK_COMM_LEN];
     char path_buf[256];
     char *path;
@@ -491,7 +506,8 @@ static int touch_try_patch_file(struct file *file)
     if (!strcmp(leader, "surfaceflinger"))
         return 0;
 
-    if (!file->f_op || !file->f_op->read)
+    original = READ_ONCE(file->f_op);
+    if (!original || !original->read)
         return 0;
 
     if (!file->f_path.dentry || !file->f_path.dentry->d_name.name)
@@ -546,16 +562,24 @@ static int touch_try_patch_file(struct file *file)
         return 0;
     }
 
+    spin_lock_irqsave(&g_touch_binding_lock, flags);
     if (g_touch_proxy_installed) {
         g_touch_status.last_reject_reason = TOUCH_REJECT_INSTALLED;
-        touch_stop_read_hook();
+        spin_unlock_irqrestore(&g_touch_binding_lock, flags);
+        schedule_work(&g_touch_stop_read_work);
+        return 0;
+    }
+    if (READ_ONCE(file->f_op) != original || !try_module_get(THIS_MODULE)) {
+        spin_unlock_irqrestore(&g_touch_binding_lock, flags);
         return 0;
     }
 
-    memcpy(&g_touch_proxy_fops, file->f_op, sizeof(g_touch_proxy_fops));
-    g_touch_orig_read = file->f_op->read;
+    g_touch_original_fops = original;
+    g_touch_orig_read = original->read;
+    g_touch_proxy_fops = *original;
+    g_touch_proxy_fops.owner = THIS_MODULE;
     g_touch_proxy_fops.read = touch_read_proxy;
-    file->f_op = &g_touch_proxy_fops;
+    g_touch_proxy_fops.release = touch_proxy_release;
     g_touch_input_dev = idev;
     touch_cache_device_caps(idev);
     g_touch_proxy_installed = true;
@@ -582,8 +606,10 @@ static int touch_try_patch_file(struct file *file)
     g_touch_status.has_btn_touch =
         g_touch_device_caps.has_btn_touch ? 1 : 0;
     g_touch_status.last_reject_reason = TOUCH_REJECT_NONE;
+    smp_store_release(&file->f_op, &g_touch_proxy_fops);
+    spin_unlock_irqrestore(&g_touch_binding_lock, flags);
 
-    touch_stop_read_hook();
+    schedule_work(&g_touch_stop_read_work);
     pr_info("touch proxy installed on %s for %s (absX=[%d,%d] absY=[%d,%d])\n",
             path, current->comm,
             g_touch_status.abs_x_min, g_touch_status.abs_x_max,
@@ -611,26 +637,22 @@ static int touch_read_pre_handler(struct kprobe *p, struct pt_regs *regs)
 
 static int touch_start_read_hook(void)
 {
-    int ret;
+    int ret = 0;
 
-    if (g_touch_proxy_installed || g_touch_read_hook_registered)
-        return 0;
-
-    if (!g_touch_stop_work_initialized) {
-        INIT_WORK(&g_touch_stop_read_work, touch_stop_read_workfn);
-        g_touch_stop_work_initialized = true;
-    }
+    mutex_lock(&g_touch_hook_lock);
+    if (READ_ONCE(g_touch_proxy_installed) || g_touch_read_hook_registered)
+        goto out;
 
     memset(&g_touch_read_kprobe, 0, sizeof(g_touch_read_kprobe));
     g_touch_read_kprobe.symbol_name = "__arm64_sys_read";
     g_touch_read_kprobe.pre_handler = touch_read_pre_handler;
 
     ret = register_kprobe(&g_touch_read_kprobe);
-    if (ret < 0)
-        return ret;
-
-    g_touch_read_hook_registered = true;
-    return 0;
+    if (!ret)
+        g_touch_read_hook_registered = true;
+out:
+    mutex_unlock(&g_touch_hook_lock);
+    return ret;
 }
 
 long touch_init(void)
@@ -701,15 +723,22 @@ void touch_release_all(void)
     mutex_unlock(&g_touch_lock);
 }
 
+int touch_quiesce_read_hook(void)
+{
+    mutex_lock(&g_touch_hook_lock);
+    touch_unregister_read_hook_now();
+    mutex_unlock(&g_touch_hook_lock);
+
+    /* The probe can no longer queue work. */
+    cancel_work_sync(&g_touch_stop_read_work);
+    return READ_ONCE(g_touch_status.installed) ? -EBUSY : 0;
+}
+
 void touch_exit(void)
 {
     touch_release_all();
-
-    if (g_touch_stop_work_initialized)
-        cancel_work_sync(&g_touch_stop_read_work);
-
+    touch_quiesce_read_hook();
     mutex_lock(&g_touch_lock);
-    touch_unregister_read_hook_now();
     g_touch_proxy_installed = false;
     g_touch_orig_read = NULL;
     g_touch_input_dev = NULL;
