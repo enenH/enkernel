@@ -48,12 +48,13 @@ jobs:
           make -j"$(nproc)" KDIR="${KERNEL_SRC:?KERNEL_SRC is not set}"
           test -s dfm.ko
           # Never accept a stub-only build of the PTE ABI.
-          llvm-nm --defined-only dfm.ko | awk '$NF ~ /^step_handler([.]|$)/ { found = 1 } END { exit !found }'
+          grep -oE -- '-DDFM_PTE_[A-Z0-9_]+' .pte_bp.o.cmd | sort -u
           if [[ "$KMI" == android17-6.18 ]]; then
             grep -q -- '-DDFM_PTE_SOFTSTEP_KPROBE' .pte_bp.o.cmd
             llvm-nm --defined-only dfm.ko | awk '$NF ~ /^softstep_pre([.]|$)/ { found = 1 } END { exit !found }'
           else
             grep -q -- '-DDFM_PTE_USER_STEP_HOOK' .pte_bp.o.cmd
+            llvm-nm --defined-only dfm.ko | awk '$NF ~ /^step_handler([.]|$)/ { found = 1 } END { exit !found }'
           fi
           # Fail if source-tree ABI detection silently disabled swap support.
           grep -q -- '-DDFM_SWAP_READER_KNOWN' .mem.o.cmd
