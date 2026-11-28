@@ -47,7 +47,11 @@ struct file { int id; };
 struct mmu_notifier { int unused; };
 struct mmu_notifier_range { unsigned long start, end; };
 struct pt_regs { uint64_t regs[31], sp, pc, pstate; int kernel, compat; };
-struct task_struct { struct mm_struct *mm; int ptrace, step, refs, pid, tid; };
+struct user_fpsimd_state { unsigned __int128 vregs[32]; uint32_t fpsr, fpcr, reserved[2]; };
+struct task_struct {
+    struct mm_struct *mm; int ptrace, step, refs, pid, tid;
+    struct { struct { struct user_fpsimd_state fpsimd_state; } uw; } thread;
+};
 struct kernel_siginfo {};
 struct k_sigaction {};
 struct step_hook { int (*fn)(struct pt_regs *, unsigned long); };
@@ -74,6 +78,20 @@ static int register_kprobe(struct kprobe *probe)
 static void unregister_kprobe(struct kprobe *probe) { assert(probe == &softstep_probe); ++unregistrations; }
 #endif
 static struct task_struct *current;
+static struct user_fpsimd_state live_fp;
+static bool supports_fp = true;
+static int preserve_calls;
+static bool system_supports_fpsimd(void) { return supports_fp; }
+static void preserve_mock(void) {
+    ++preserve_calls;
+    current->thread.uw.fpsimd_state = live_fp;
+}
+static void (*preserve_user_fpsimd)(void) = preserve_mock;
+static void (*sync_user_fpsimd)(struct task_struct *);
+static struct user_fpsimd_state saved_sve;
+static int sync_calls;
+static void preserve_sve_mock(void) { ++preserve_calls; saved_sve = live_fp; }
+static void sync_sve_mock(struct task_struct *t) { ++sync_calls; t->thread.uw.fpsimd_state = saved_sve; }
 static spinlock_t state_lock;
 static int tlbs;
 static int inject_hardware_update;
@@ -105,6 +123,10 @@ static void unlock_pte(spinlock_t *lock) { (void)lock; }
 static void disable_local_step(struct pt_regs *r)
 { current->step = 0; r->pstate &= ~DBG_SPSR_SS; }
 #include "pte_under_test.h"
+static void preserve_and_change_generation(void) {
+    preserve_mock();
+    ++session->snapshot.generation;
+}
 
 static struct pte_session state;
 static struct mm_struct mm;
@@ -123,6 +145,13 @@ static void reset(void)
     state.page[0].page = &code; mm.entries[0] = 0x1001;
     state.snapshot.point_count = 1; state.snapshot.addresses[0] = PAGE_SIZE;
     regs.pc = PAGE_SIZE; regs.sp = 0x1234; regs.regs[5] = 0x5566;
+    preserve_calls = 0; supports_fp = true; preserve_user_fpsimd = preserve_mock;
+    sync_user_fpsimd = NULL; sync_calls = 0;
+    memset(&live_fp, 0, sizeof(live_fp));
+    for (unsigned n = 0; n < 32; ++n)
+        live_fp.vregs[n] = ((unsigned __int128)(0x123456789abcdef0ULL + n) << 64) |
+                          (0xfedcba9876543210ULL - n);
+    live_fp.fpcr = 0x00400000; live_fp.fpsr = 0x08000001;
     ((u32 *)code.data)[0] = 0xd503201f; // NOP
     assert(set_armed(&mm, &state.page[0], true) == 0);
 }
@@ -141,8 +170,13 @@ int main(void)
     assert(step_register_call(true) == -EOPNOTSUPP && unregistrations == 3);
     relocate_probe = 0;
 #endif
+    _Static_assert(DFM_PTE_ABI_VERSION == 2, "PTE vector ABI is versioned");
+    _Static_assert(offsetof(struct dfm_pte_record, q) == 304, "fixed vector ABI offset");
+    _Static_assert(sizeof(struct dfm_pte_record) == 832, "fixed vector ABI size");
     struct dfm_pte_set_req request = { .abi_version = 1, .pid = 1, .point_count = 1,
                                      .addresses = {4096} };
+    assert(dfm_pte_validate(&request, 1ULL << 48) == -EINVAL);
+    request.abi_version = DFM_PTE_ABI_VERSION;
     assert(dfm_pte_validate(&request, 1ULL << 48) == 0);
     request.addresses[0] = UINT64_MAX; assert(dfm_pte_validate(&request, 1ULL << 48) == -EINVAL);
     request.addresses[0] = 4098; assert(dfm_pte_validate(&request, 1ULL << 48) == -EINVAL);
@@ -185,6 +219,11 @@ int main(void)
     }
     assert(state.snapshot.record_count == 64 && state.snapshot.dropped == 136);
     assert(state.snapshot.records[199 % 64].x[5] == 0x5566);
+    const struct dfm_pte_record *record = &state.snapshot.records[199 % 64];
+    assert(preserve_calls == 200 && record->fp_status == 0);
+    assert(!memcmp(record->q, live_fp.vregs, sizeof(record->q)));
+    assert(record->fpcr == live_fp.fpcr && record->fpsr == live_fp.fpsr);
+    assert(!memcmp(&current->thread.uw.fpsimd_state, &live_fp, sizeof(live_fp)));
     assert(state.snapshot.rearms == 200 && step_handler(&regs, 0) == DBG_HOOK_ERROR);
     reset();
     mm.entries[0] |= PTE_AF | PTE_DIRTY;
@@ -192,6 +231,31 @@ int main(void)
     cancel_current(&regs);
     assert(mm.entries[0] & PTE_AF); assert(mm.entries[0] & PTE_DIRTY);
     assert(!task.step && !task.refs && state.page[0].armed);
+    reset(); preserve_user_fpsimd = NULL;
+    memset(&current->thread.uw.fpsimd_state, 0xa5, sizeof(live_fp));
+    assert(handle_fault(regs.pc, syndrome, &regs));
+    record = &state.snapshot.records[0];
+    assert(record->fp_status == -EOPNOTSUPP && !record->q[0][0] && !record->fpcr);
+    assert(!preserve_calls); cancel_current(&regs);
+    reset(); preserve_user_fpsimd = preserve_sve_mock; sync_user_fpsimd = sync_sve_mock;
+    memset(&current->thread.uw.fpsimd_state, 0xa5, sizeof(live_fp));
+    assert(handle_fault(regs.pc, syndrome, &regs));
+    record = &state.snapshot.records[0];
+    assert(!record->fp_status && !memcmp(record->q, live_fp.vregs, sizeof(record->q)));
+    assert(preserve_calls == 1 && sync_calls == 1); cancel_current(&regs);
+    reset(); preserve_user_fpsimd = preserve_and_change_generation;
+    assert(handle_fault(regs.pc, syndrome, &regs));
+    record = &state.snapshot.records[0];
+    assert(record->fp_status == -ESTALE && !record->q[31][1] && !record->fpsr);
+    cancel_current(&regs);
+    reset(); supports_fp = false;
+    assert(handle_fault(regs.pc, syndrome, &regs));
+    assert(state.snapshot.records[0].fp_status == -EOPNOTSUPP && !preserve_calls);
+    cancel_current(&regs);
+    reset(); regs.pc += 4;
+    assert(handle_fault(regs.pc, syndrome, &regs));
+    assert(!preserve_calls && !state.snapshot.total_hits);
+    cancel_current(&regs);
     reset();
     inject_hardware_update = 1;
     assert(handle_fault(regs.pc, syndrome, &regs));
@@ -239,6 +303,6 @@ int main(void)
     task_exit(NULL, &task);
 #endif
     assert(!task.step && !task.refs && state.page[0].armed);
-    puts("PTE production fault/step/notifier model passed");
+    puts("PTE production fault/step/notifier and synchronized Q0-Q31/FPCR/FPSR model passed");
     return 0;
 }

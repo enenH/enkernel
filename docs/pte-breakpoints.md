@@ -1,7 +1,7 @@
 # Persistent PTE execution breakpoints
 
 The optional PTE ABI traces ARM64 execution using a page's UXN permission and
-native EL0 single stepping. It records GPR state at the requested PC, runs the
+native EL0 single stepping. It records GPR and user FPSIMD state at the requested PC, runs the
 original instruction, then rearms the page automatically. It needs no hardware
 breakpoint slot. It does not modify instruction bytes or redirect execution
 to an emulator/shadow page. Existing hardware breakpoint ioctls remain separate.
@@ -24,9 +24,13 @@ Include dfm/driver.h and link enkernel::sdk. These methods return negative errno
     rc = dfm::pte_set(target_pid, addresses, 1);
     dfm_pte_snapshot snapshot{};
     rc = dfm::pte_read(snapshot);
+    // Each record: fp_status == 0 validates q[0..31], fpcr and fpsr.
+    // q[n][0] is the low 64 bits; q[n][1] is the high 64 bits.
     rc = dfm::pte_clear();
 
-Raw requests use ABI version 1. Reserved/unused fields and trailing point
+Raw requests use ABI version 2. The prior GPR-only ABI 1 is rejected with EINVAL;
+old/new SDKs and modules must not reinterpret each other's snapshots. The ioctl
+numbers remain unchanged. Reserved/unused fields and trailing point
 addresses must be zero. PCs must be nonzero, untagged, four-byte aligned user
 addresses. Up to 16 distinct PCs can share pages. A single session is owned by
 the exact driver file description that created it; duplicate/delegated copies
@@ -39,8 +43,22 @@ normal ptrace access check, including LSM policy. A session holds the exact mm
 identity, not the numeric PID. Fork/exec/PID reuse cannot retarget it. READ is
 a non-destructive bounded snapshot with at most 64 records, ordered oldest to
 newest. Ring overwrites increment dropped. last_error is negative errno;
-armed_pages/open_pages index deduplicated pages in first-PC order. Only GPR,
-PC/SP/PSTATE, PID/TID, sequence and monotonic time are recorded, not FP/SIMD.
+armed_pages/open_pages index deduplicated pages in first-PC order. Records contain
+GPR, PC/SP/PSTATE, PID/TID, sequence and monotonic time, plus Q0-Q31 (128 bits
+each), FPCR and FPSR. A zero fp_status is required before using the vector fields;
+negative errno means unavailable, with those output fields zeroed. INFO_FPSIMD
+advertises the optional synchronized vector backend. Its absence does not disable
+GPR tracing. These are snapshots before the original instruction executes.
+
+The fault handler synchronizes current's user FP state outside the PTE/state
+spinlock, using fpsimd_signal_preserve_current_state on legacy kernels or the
+fpsimd_preserve_current_state + fpsimd_sync_from_effective_state pair on newer
+kernels. This includes lazy CPU ownership and the low-128-bit view of saved
+SVE/SME state; raw thread cache copies are not accepted as live vector snapshots.
+If the synchronization helper(s) or hardware support are absent, fp_status is
+EOPNOTSUPP. A session change during synchronization reports ESTALE for the vector
+fields. No FPSIMD register is written by the recorder. Full SVE/SME scalable
+registers, predicates, ZA and FPMR are not part of this ABI.
 The capability bit advertises the ABI, not backend availability or exact module
 commit. INFO is read-only; it does not install fault hooks.
 
@@ -122,7 +140,10 @@ overwrites the probe is outside the session's ownership.
 The host model executes production fault, native-step completion, ring and MMU
 notifier paths at O0/O2. It covers repeated rearming, AF/dirty preservation,
 stale PFNs, invalidation during a step, wrong mm/fault type, existing stepping,
-exclusive rejection, bounds and ring overflow. Both legacy and 6.18 routing
+exclusive rejection, bounds and ring overflow. Vector cases verify all Q halves,
+FPCR/FPSR, live state synchronization instead of stale saved bytes, split SVE
+conversion, missing helpers/hardware and no captures for unrequested PCs.
+Both legacy and 6.18 routing
 run at O0/O2, including foreign frames, wrong syndrome/mode, unowned events,
 entry-LR preservation, registration errors and cleanup. Source-tree detection
 tests cover legacy callback widths, 6.18, blacklists, unknown ABI and CRLF.
@@ -131,8 +152,9 @@ the unused sys/ioctl.h include; it does not emulate kernel/MMU correctness.
 
 Build with ENKERNEL_BUILD_TESTS=ON and run dfm_pte_check as root on an authorized
 device with the matching module already loaded. The fixture is a forked child's
-own private ADD/RET page. It verifies two batches of exact persistent hits and
-GPR snapshots on an otherwise isolated child, native results, unchanged code,
+own private, relocation-free vector-load/ADD/vector-store page. It verifies two
+batches of exact persistent hits and GPR/Q0-Q31/FPCR/FPSR snapshots on an otherwise
+isolated child, native results, unchanged code, unchanged vector/control state,
 bounded ring behavior and clear/retry. Unsupported/old modules return exit 77
 (skip), never a pass. This test never loads/unloads modules or changes SELinux.
 Six-KMI CI requires the native backend on every ABI and checks that 6.18 includes

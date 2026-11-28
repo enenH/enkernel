@@ -25,7 +25,9 @@
 #include <linux/vmalloc.h>
 #include <trace/events/sched.h>
 #include <asm/debug-monitors.h>
+#include <asm/cpufeature.h>
 #include <asm/esr.h>
+#include <asm/fpsimd.h>
 #include <asm/pgtable.h>
 #include <asm/sysreg.h>
 #include "abi.h"
@@ -100,6 +102,8 @@ static unsigned long softstep_address;
 static struct kprobe softstep_probe;
 #endif
 static bool (*target_access)(struct task_struct *, unsigned int);
+static void (*preserve_user_fpsimd)(void);
+static void (*sync_user_fpsimd)(struct task_struct *);
 static struct tracepoint *fork_trace, *exit_trace, *sys_trace, *signal_trace;
 static bool fork_registered, exit_registered, sys_registered, signal_registered;
 
@@ -267,8 +271,24 @@ NOKPROBE_SYMBOL(softstep_pre);
 #endif
 /* PTE_STEP_ROUTER_END */
 
+/* Called in the user-fault task context, before taking state_lock/irqsave.
+ * The signal helper first synchronizes live CPU registers, then converts a
+ * saved SVE/SME register image to its low-128-bit FPSIMD view. Copying only
+ * thread.uw.fpsimd_state without that helper could publish stale registers.
+ * No user instruction runs between synchronization and the copy. */
+static __nocfi int capture_fpsimd(struct user_fpsimd_state *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!preserve_user_fpsimd || !system_supports_fpsimd()) return -EOPNOTSUPP;
+    preserve_user_fpsimd();
+    if (sync_user_fpsimd) sync_user_fpsimd(current);
+    memcpy(out, &current->thread.uw.fpsimd_state, sizeof(*out));
+    return 0;
+}
+
 static void record_hit(struct pte_session *s, unsigned long pc,
-                        struct pt_regs *regs)
+                        struct pt_regs *regs, const struct user_fpsimd_state *fp,
+                        int fp_status)
 {
     struct dfm_pte_snapshot *out = &s->snapshot;
     struct dfm_pte_record *r;
@@ -285,6 +305,12 @@ static void record_hit(struct pte_session *s, unsigned long pc,
     memcpy(r->x, regs->regs, sizeof(r->x));
     r->pid = task_tgid_vnr(current);
     r->tid = task_pid_vnr(current);
+    r->fp_status = fp_status;
+    if (!fp_status) {
+        memcpy(r->q, fp->vregs, sizeof(r->q));
+        r->fpcr = fp->fpcr;
+        r->fpsr = fp->fpsr;
+    }
     if (out->record_count < DFM_PTE_MAX_RECORDS) ++out->record_count;
     else ++out->dropped;
 }
@@ -298,11 +324,29 @@ static bool handle_fault(unsigned long far, unsigned long esr,
     unsigned int i, index = 0, free_step = DFM_PTE_MAX_STEPPERS;
     unsigned long flags, pc = untagged_addr(regs->pc);
     u32 instruction;
+    struct user_fpsimd_state fp;
+    u64 fp_generation = 0;
+    int fp_status = -EOPNOTSUPP;
+    bool need_fp = false;
     bool handled = false;
     if (!user_mode(regs) || compat_user_mode(regs) ||
         ESR_ELx_EC(esr) != ESR_ELx_EC_IABT_LOW ||
         (esr & ESR_ELx_FSC) != 0x0f || untagged_addr(far) != pc)
         return false;
+    /* Only requested PCs need vector synchronization. Do not run the helper
+     * under the PTE/state spinlock: it manages the kernel's FPSIMD context
+     * exclusion itself. Teardown may run here; revalidate the generation below. */
+    spin_lock_irqsave(&state_lock, flags);
+    s = session;
+    if (s && s->active && s->mm == current->mm)
+        for (i = 0; i < s->snapshot.point_count; ++i)
+            if (s->snapshot.addresses[i] == pc) {
+                need_fp = true;
+                fp_generation = s->snapshot.generation;
+                break;
+            }
+    spin_unlock_irqrestore(&state_lock, flags);
+    if (need_fp) fp_status = capture_fpsimd(&fp);
     spin_lock_irqsave(&state_lock, flags);
     s = session;
     if (!s || !s->active || s->mm != current->mm) goto out;
@@ -331,7 +375,8 @@ static bool handle_fault(unsigned long far, unsigned long esr,
         disarm_page(s, index, -ESTALE);
         goto out;
     }
-    record_hit(s, pc, regs);
+    if (need_fp && fp_generation != s->snapshot.generation) fp_status = -ESTALE;
+    record_hit(s, pc, regs, &fp, fp_status);
     get_task_struct(current);
     s->steps[free_step].task = current;
     s->steps[free_step].page = index;
@@ -537,6 +582,18 @@ static int resolve_backend(void)
 {
     unsigned int i;
     if (hooks_ready) return 0;
+    preserve_user_fpsimd = (void *)symbol("fpsimd_signal_preserve_current_state");
+    sync_user_fpsimd = NULL;
+    if (!preserve_user_fpsimd) {
+        /* Newer kernels split signal preservation into these two helpers.
+         * Never use plain preserve alone: an SVE task's FPSIMD view may be old. */
+        preserve_user_fpsimd = (void *)symbol("fpsimd_preserve_current_state");
+        sync_user_fpsimd = (void *)symbol("fpsimd_sync_from_effective_state");
+        if (!preserve_user_fpsimd || !sync_user_fpsimd) {
+            preserve_user_fpsimd = NULL;
+            sync_user_fpsimd = NULL;
+        }
+    }
     fault_table = (void *)symbol("fault_info");
 #ifdef DFM_PTE_USER_STEP_HOOK
     register_step = (void *)symbol("register_user_step_hook");
@@ -639,6 +696,7 @@ long dfm_pte_info(void __user *arg)
     mutex_lock(&control_lock);
     backend_error = resolve_backend();
     req.flags = DFM_PTE_INFO_STEP_WINDOW | (!backend_error ? DFM_PTE_INFO_AVAILABLE : 0);
+    if (preserve_user_fpsimd && system_supports_fpsimd()) req.flags |= DFM_PTE_INFO_FPSIMD;
     req.backend_errno = backend_error;
     mutex_unlock(&control_lock);
     return copy_to_user(arg, &req, sizeof(req)) ? -EFAULT : 0;

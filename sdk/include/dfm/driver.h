@@ -90,6 +90,7 @@ namespace dfm {
      * clear it. See docs/pte-breakpoints.md for page/stepping restrictions. */
     long pte_info(dfm_pte_info_req& out);
     long pte_set(int pid, const uint64_t* addresses, size_t count);
+    // ABI 2: q[32][2]/fpcr/fpsr are valid only when record.fp_status == 0.
     long pte_read(dfm_pte_snapshot& out);
     long pte_clear();
     /* Raw result of the most recent issued ioctl on this thread (negative errno).

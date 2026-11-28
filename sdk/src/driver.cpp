@@ -32,6 +32,10 @@ static_assert(offsetof(dfm_file_query_req, offset) == 32U);
 static_assert(offsetof(dfm_file_query_req, out_size) == 48U);
 static_assert(offsetof(dfm_file_query_req, reserved) == 104U);
 static_assert(sizeof(dfm_sf_groups_req) == 32U);
+static_assert(DFM_PTE_ABI_VERSION == 2U);
+static_assert(offsetof(dfm_pte_record, q) == 304U);
+static_assert(sizeof(dfm_pte_record) == 832U);
+static_assert(sizeof(dfm_pte_snapshot) == 53456U);
 
 namespace dfm {
     static int g_fd = -1;
@@ -538,6 +542,7 @@ namespace dfm {
         dfm_pte_info_req req{};
         req.abi_version = DFM_PTE_ABI_VERSION;
         const long ret = call_ioctl(g_fd, DFM_IOCTL_PTE_INFO, (long)&req);
+        if (!ret && req.abi_version != DFM_PTE_ABI_VERSION) return -EPROTO;
         if (!ret) out = req;
         return ret;
     }
@@ -563,6 +568,10 @@ namespace dfm {
         req.buf_size = sizeof(out);
         const long ret = call_ioctl(g_fd, DFM_IOCTL_PTE_READ, (long)&req);
         if (ret) out = {};
+        else if (out.abi_version != DFM_PTE_ABI_VERSION || req.out_size != sizeof(out)) {
+            out = {};
+            return -EPROTO;
+        }
         return ret;
     }
 

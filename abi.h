@@ -91,16 +91,18 @@ struct dfm_capabilities_req {
  * through a page during its native-step window; this is not a lossless tracer.
  * Mapping invalidation disarms affected pages. Unsupported exclusive/atomic
  * instructions disarm a page rather than disturb its reservation semantics.
- * Only GPR state is collected. No instruction bytes or register values change.
+ * ABI 2 adds synchronized Q0-Q31/FPCR/FPSR. fp_status must be zero before
+ * using vector values. No instruction bytes or register values change.
  * SET requires CAP_SYS_PTRACE in init_user_ns and target ptrace permission.
  * INFO reports runtime backend availability; the capability bit names the ABI.
  */
-#define DFM_PTE_ABI_VERSION 1U
+#define DFM_PTE_ABI_VERSION 2U
 #define DFM_PTE_MAX_POINTS 16U
 #define DFM_PTE_MAX_RECORDS 64U
 #define DFM_PTE_MAX_STEPPERS 64U
 #define DFM_PTE_INFO_AVAILABLE (1U << 0)
 #define DFM_PTE_INFO_STEP_WINDOW (1U << 1)
+#define DFM_PTE_INFO_FPSIMD (1U << 2)
 #define DFM_PTE_ACTIVE (1U << 0)
 #define DFM_PTE_INVALIDATED (1U << 1)
 struct dfm_pte_info_req {
@@ -120,6 +122,10 @@ struct dfm_pte_record {
     uint64_t sequence, timestamp_ns, address, pc, sp, pstate;
     uint64_t x[31];
     int32_t pid, tid;
+    uint64_t q[32][2]; /* q[n][0]: low 64 bits, q[n][1]: high 64 bits */
+    uint32_t fpcr, fpsr;
+    int32_t fp_status; /* 0: synchronized user FPSIMD; negative errno: unavailable */
+    uint32_t reserved;
 };
 /* Non-destructive, oldest-to-newest bounded snapshot. dropped counts records
  * overwritten by the ring; it does not count unobservable concurrent passes.
