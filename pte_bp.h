@@ -6,6 +6,7 @@ struct file;
 long dfm_pte_info(void __user *arg);
 long dfm_pte_set(struct file *owner, void __user *arg);
 long dfm_pte_read(struct file *owner, void __user *arg);
+long dfm_pte_rules(struct file *owner, void __user *arg);
 long dfm_pte_clear(struct file *owner);
 void dfm_pte_release(struct file *owner);
 void dfm_pte_exit(void);

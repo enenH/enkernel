@@ -36,6 +36,9 @@ static_assert(DFM_PTE_ABI_VERSION == 2U);
 static_assert(offsetof(dfm_pte_record, q) == 304U);
 static_assert(sizeof(dfm_pte_record) == 832U);
 static_assert(sizeof(dfm_pte_snapshot) == 53456U);
+static_assert(sizeof(dfm_pte_rule) == 792U);
+static_assert(sizeof(dfm_pte_rules_req) == 32U);
+static_assert(offsetof(dfm_pte_record, patch_status) == 828U);
 
 namespace dfm {
     static int g_fd = -1;
@@ -573,6 +576,17 @@ namespace dfm {
             return -EPROTO;
         }
         return ret;
+    }
+
+    long pte_rules(uint64_t generation, const dfm_pte_rule* rules, size_t count) {
+        if (g_fd < 0) return -EBADF;
+        if (!generation || count > DFM_PTE_MAX_POINTS || (!!count != !!rules)) return -EINVAL;
+        dfm_pte_rules_req req{};
+        req.abi_version = DFM_PTE_RULES_ABI_VERSION;
+        req.generation = generation;
+        req.rules = reinterpret_cast<uint64_t>(rules);
+        req.count = static_cast<uint32_t>(count);
+        return call_ioctl(g_fd, DFM_IOCTL_PTE_RULES, (long)&req);
     }
 
     long pte_clear() {

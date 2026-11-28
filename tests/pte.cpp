@@ -23,6 +23,14 @@ static VectorImage vector_image(unsigned batch, uint64_t value) {
     out.fpsr = 1U << batch;
     return out;
 }
+static dfm_pte_rule write_rule(uint64_t address, unsigned batch) {
+    dfm_pte_rule r{};r.address=address;r.x_mask=1;r.x[0]=1024+batch;
+    r.q_mask=1U | (1U<<31);r.flags=DFM_PTE_RULE_FPCR | DFM_PTE_RULE_FPSR;
+    r.q[0][0]=0x1122334455667788ULL+batch;r.q[0][1]=0x8877665544332211ULL+batch;
+    r.q[31][0]=0xabcdef0198765432ULL+batch;r.q[31][1]=0x1234567890abcdefULL+batch;
+    r.fpcr=0x00400000;r.fpsr=0x08000001;
+    return r;
+}
 
 static void require(bool ok, const char* what) {
     if (!ok) { std::fprintf(stderr, "FAIL: %s (errno=%d)\n", what, errno); throw std::runtime_error(what); }
@@ -41,8 +49,10 @@ static int run() {
     dfm_pte_info_req info{};
     const auto result = dfm::pte_info(info);
     if (result == -ENOTTY || result == -EINVAL || (!result &&
-        (info.flags & (DFM_PTE_INFO_AVAILABLE | DFM_PTE_INFO_FPSIMD)) !=
-        (DFM_PTE_INFO_AVAILABLE | DFM_PTE_INFO_FPSIMD))) {
+        (info.flags & (DFM_PTE_INFO_AVAILABLE | DFM_PTE_INFO_FPSIMD |
+                       DFM_PTE_INFO_WRITE_GPR | DFM_PTE_INFO_WRITE_FPSIMD)) !=
+        (DFM_PTE_INFO_AVAILABLE | DFM_PTE_INFO_FPSIMD |
+         DFM_PTE_INFO_WRITE_GPR | DFM_PTE_INFO_WRITE_FPSIMD))) {
         std::printf("SKIP: PTE backend unavailable (%ld/%d)\n", result, info.backend_errno);
         dfm::close(); return 77;
     }
@@ -61,10 +71,17 @@ static int run() {
     if (!child) {
         raise(SIGSTOP);
         auto fn = reinterpret_cast<uint64_t (*)(uint64_t, const VectorImage*, VectorImage*)>(code);
-        for (unsigned batch = 0; batch < 3; ++batch) {
+        for (unsigned batch = 0; batch < 6; ++batch) {
             for (uint64_t i = 0; i < 100; ++i) {
                 const auto in = vector_image(batch, i); VectorImage returned{};
-                if (fn(i, &in, &returned) != i + 1 || std::memcmp(&in, &returned, sizeof(in))) _exit(3);
+                auto expected=in;uint64_t expected_result=i+1;
+                if (batch==2 || batch==3) {
+                    const auto r=write_rule(0, batch);
+                    expected_result=r.x[0]+1;
+                    std::memcpy(expected.q[0],r.q[0],16);std::memcpy(expected.q[31],r.q[31],16);
+                    expected.fpcr=r.fpcr;expected.fpsr=r.fpsr;
+                }
+                if (fn(i, &in, &returned) != expected_result || std::memcmp(&expected, &returned, sizeof(in))) _exit(3);
             }
             raise(SIGSTOP);
         }
@@ -87,9 +104,17 @@ static int run() {
     require(dfm::pte_set(child, &address, 1) == 0, "set PTE breakpoint");
     require(dfm::pte_set(child, &address, 1) == -EALREADY, "owned session not replaced");
     auto out = std::make_unique<dfm_pte_snapshot>();
-    for (unsigned batch = 0; batch < 2; ++batch) {
+    uint64_t session_generation=0;
+    for (unsigned batch = 0; batch < 5; ++batch) {
+        if (batch==2 || batch==3) {
+            const auto rule=write_rule(address,batch);
+            require(dfm::pte_rules(session_generation,&rule,1)==0,"install/replace persistent rules once per batch");
+        } else if(batch==4) {
+            require(dfm::pte_rules(session_generation,nullptr,0)==0,"remove persistent rules without clearing trace");
+        }
         require(kill(child, SIGCONT) == 0, "resume child"); wait_stopped(child);
         require(dfm::pte_read(*out) == 0, "read snapshot");
+        session_generation=out->generation;
         require(out->total_hits == 100ULL * (batch + 1), "persistent exact hits on isolated child");
         require(out->record_count == 64 && out->dropped == out->total_hits - 64,
                 "bounded ring overflow");
@@ -102,6 +127,8 @@ static int run() {
         require(last.fp_status == 0 && !std::memcmp(last.q, expected.q, sizeof(last.q)) &&
                 last.fpcr == expected.fpcr && last.fpsr == expected.fpsr,
                 "Q0-Q31 including both halves, FPCR and FPSR match the pre-instruction state");
+        require(last.patch_status==((batch==2||batch==3)?DFM_PTE_PATCH_APPLIED:0),
+                "persistent rules applied only during their configured batches");
         require(std::memcmp(code, dfm_pte_vector_begin, code_bytes) == 0, "original instructions unchanged");
     }
     require(dfm::pte_clear() == 0 && dfm::pte_clear() == 0, "idempotent clear");
@@ -112,7 +139,7 @@ static int run() {
     require(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
             "native execution preserved after clear");
     cleanup.pid = -1;
-    std::puts("DFM_PTE_DEVICE_PASS: GPR + synchronized Q0-Q31/FPCR/FPSR, original vector execution preserved");
+    std::puts("DFM_PTE_DEVICE_PASS: GPR/FPSIMD, 200 autonomous masked writes, replacement/removal, pre-write snapshots and native results");
     return 0;
 }
 int main() { try { return run(); } catch (const std::exception&) { return 1; } }

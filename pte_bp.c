@@ -2,6 +2,7 @@
 /* UXN execution traps inspired by Linux-android-arm64/lsdriver. See
  * docs/third-party/LsLucky-NOTICE.md. Instructions execute natively at EL0. */
 #include <linux/capability.h>
+#include <linux/bottom_half.h>
 #include <linux/delay.h>
 #include <linux/kallsyms.h>
 #include <linux/kprobes.h>
@@ -65,12 +66,17 @@ struct pte_session {
     struct pte_page page[DFM_PTE_MAX_POINTS];
     struct pte_step steps[DFM_PTE_MAX_STEPPERS];
     struct dfm_pte_snapshot snapshot;
+    struct dfm_pte_rule rules[DFM_PTE_MAX_POINTS];
+    u64 rules_revision;
+    unsigned int rule_count;
+    bool rules_active;
 };
 static DEFINE_MUTEX(control_lock);
 static DEFINE_SPINLOCK(state_lock);
 static struct pte_session *session;
 static u64 generation;
 DEFINE_STATIC_SRCU(fault_srcu);
+DEFINE_STATIC_SRCU(patch_srcu);
 
 #ifdef DFM_PTE_STEP_ESR32
 typedef unsigned int pte_step_esr_t;
@@ -104,6 +110,8 @@ static struct kprobe softstep_probe;
 static bool (*target_access)(struct task_struct *, unsigned int);
 static void (*preserve_user_fpsimd)(void);
 static void (*sync_user_fpsimd)(struct task_struct *);
+static void (*update_user_fpsimd)(const struct user_fpsimd_state *);
+static void (*flush_user_fpsimd)(struct task_struct *);
 static struct tracepoint *fork_trace, *exit_trace, *sys_trace, *signal_trace;
 static bool fork_registered, exit_registered, sys_registered, signal_registered;
 
@@ -286,9 +294,37 @@ static __nocfi int capture_fpsimd(struct user_fpsimd_state *out)
     return 0;
 }
 
+static bool fpsimd_write_ready(void)
+{
+    return preserve_user_fpsimd && update_user_fpsimd && flush_user_fpsimd &&
+           system_supports_fpsimd();
+}
+static __nocfi void commit_fpsimd(const struct user_fpsimd_state *fp)
+{
+    /* Older update helpers load live registers; newer ones update only saved
+     * state (including SVE low lanes). Invalidate CPU ownership first so neither
+     * a context switch nor return-to-EL0 can overwrite the replacement with an
+     * old live image. No spinlock/irqsave surrounds these context helpers. */
+    local_bh_disable();
+    flush_user_fpsimd(current);
+    update_user_fpsimd(fp);
+    local_bh_enable();
+}
+static void replace_registers(const struct dfm_pte_rule *rule, struct pt_regs *regs,
+                              struct user_fpsimd_state *fp)
+{
+    unsigned int i;
+    for (i = 0; i < 31; ++i)
+        if (rule->x_mask & (1U << i)) regs->regs[i] = rule->x[i];
+    for (i = 0; i < 32; ++i)
+        if (rule->q_mask & (1U << i)) memcpy(&fp->vregs[i], rule->q[i], 16);
+    if (rule->flags & DFM_PTE_RULE_FPCR) fp->fpcr = rule->fpcr;
+    if (rule->flags & DFM_PTE_RULE_FPSR) fp->fpsr = rule->fpsr;
+}
+
 static void record_hit(struct pte_session *s, unsigned long pc,
                         struct pt_regs *regs, const struct user_fpsimd_state *fp,
-                        int fp_status)
+                        int fp_status, int patch_status)
 {
     struct dfm_pte_snapshot *out = &s->snapshot;
     struct dfm_pte_record *r;
@@ -306,6 +342,7 @@ static void record_hit(struct pte_session *s, unsigned long pc,
     r->pid = task_tgid_vnr(current);
     r->tid = task_pid_vnr(current);
     r->fp_status = fp_status;
+    r->patch_status = patch_status;
     if (!fp_status) {
         memcpy(r->q, fp->vregs, sizeof(r->q));
         r->fpcr = fp->fpcr;
@@ -325,14 +362,19 @@ static bool handle_fault(unsigned long far, unsigned long esr,
     unsigned long flags, pc = untagged_addr(regs->pc);
     u32 instruction;
     struct user_fpsimd_state fp;
+    struct dfm_pte_rule rule;
     u64 fp_generation = 0;
+    u64 rules_revision = 0;
     int fp_status = -EOPNOTSUPP;
+    int patch_status = 0, patch_index;
+    bool have_rule = false, write_fp = false;
     bool need_fp = false;
     bool handled = false;
     if (!user_mode(regs) || compat_user_mode(regs) ||
         ESR_ELx_EC(esr) != ESR_ELx_EC_IABT_LOW ||
         (esr & ESR_ELx_FSC) != 0x0f || untagged_addr(far) != pc)
         return false;
+    patch_index = srcu_read_lock(&patch_srcu);
     /* Only requested PCs need vector synchronization. Do not run the helper
      * under the PTE/state spinlock: it manages the kernel's FPSIMD context
      * exclusion itself. Teardown may run here; revalidate the generation below. */
@@ -343,6 +385,16 @@ static bool handle_fault(unsigned long far, unsigned long esr,
             if (s->snapshot.addresses[i] == pc) {
                 need_fp = true;
                 fp_generation = s->snapshot.generation;
+                rules_revision = s->rules_revision;
+                if (s->rules_active) {
+                    unsigned int j;
+                    for (j = 0; j < s->rule_count; ++j)
+                        if (s->rules[j].address == pc) {
+                            rule = s->rules[j];
+                            have_rule = true;
+                            break;
+                        }
+                }
                 break;
             }
     spin_unlock_irqrestore(&state_lock, flags);
@@ -376,7 +428,18 @@ static bool handle_fault(unsigned long far, unsigned long esr,
         goto out;
     }
     if (need_fp && fp_generation != s->snapshot.generation) fp_status = -ESTALE;
-    record_hit(s, pc, regs, &fp, fp_status);
+    if (have_rule) {
+        if (fp_generation != s->snapshot.generation || !s->rules_active ||
+            rules_revision != s->rules_revision) patch_status = -ESTALE;
+        else if (dfm_pte_rule_uses_fp(&rule) && fp_status) patch_status = fp_status;
+        else if (dfm_pte_rule_uses_fp(&rule) && !fpsimd_write_ready()) patch_status = -EOPNOTSUPP;
+        else patch_status = DFM_PTE_PATCH_APPLIED;
+    }
+    record_hit(s, pc, regs, &fp, fp_status, patch_status);
+    if (patch_status == DFM_PTE_PATCH_APPLIED) {
+        replace_registers(&rule, regs, &fp);
+        write_fp = dfm_pte_rule_uses_fp(&rule);
+    }
     get_task_struct(current);
     s->steps[free_step].task = current;
     s->steps[free_step].page = index;
@@ -390,6 +453,8 @@ conflict:
     handled = true;
 out:
     spin_unlock_irqrestore(&state_lock, flags);
+    if (write_fp) commit_fpsimd(&fp);
+    srcu_read_unlock(&patch_srcu, patch_index);
     return handled;
 }
 
@@ -485,6 +550,8 @@ static void mm_release(struct mmu_notifier *notifier, struct mm_struct *mm)
     for (i = 0; i < s->pages; ++i)
         if (s->page[i].valid) disarm_page(s, i, -ESRCH);
     s->active = false;
+    s->rules_active = false;
+    ++s->rules_revision;
     spin_unlock_irqrestore(&state_lock, flags);
 }
 static const struct mmu_notifier_ops notifier_ops = {
@@ -518,7 +585,10 @@ static void stop_session(void)
     if (!s) return;
     spin_lock_irqsave(&state_lock, flags);
     s->active = false;
+    s->rules_active = false;
+    ++s->rules_revision;
     spin_unlock_irqrestore(&state_lock, flags);
+    synchronize_srcu(&patch_srcu);
     if (s->registered) mmu_notifier_unregister(&s->notifier, s->mm);
     spin_lock_irqsave(&state_lock, flags);
     for (i = 0; i < s->pages; ++i)
@@ -594,6 +664,8 @@ static int resolve_backend(void)
             sync_user_fpsimd = NULL;
         }
     }
+    update_user_fpsimd = (void *)symbol("fpsimd_update_current_state");
+    flush_user_fpsimd = (void *)symbol("fpsimd_flush_task_state");
     fault_table = (void *)symbol("fault_info");
 #ifdef DFM_PTE_USER_STEP_HOOK
     register_step = (void *)symbol("register_user_step_hook");
@@ -697,6 +769,8 @@ long dfm_pte_info(void __user *arg)
     backend_error = resolve_backend();
     req.flags = DFM_PTE_INFO_STEP_WINDOW | (!backend_error ? DFM_PTE_INFO_AVAILABLE : 0);
     if (preserve_user_fpsimd && system_supports_fpsimd()) req.flags |= DFM_PTE_INFO_FPSIMD;
+    if (!backend_error) req.flags |= DFM_PTE_INFO_WRITE_GPR;
+    if (fpsimd_write_ready()) req.flags |= DFM_PTE_INFO_WRITE_FPSIMD;
     req.backend_errno = backend_error;
     mutex_unlock(&control_lock);
     return copy_to_user(arg, &req, sizeof(req)) ? -EFAULT : 0;
@@ -835,6 +909,53 @@ long dfm_pte_read(struct file *owner, void __user *arg)
     return rc;
 }
 
+long dfm_pte_rules(struct file *owner, void __user *arg)
+{
+    struct dfm_pte_rules_req req;
+    struct dfm_pte_rule *rules;
+    unsigned long flags;
+    int rc;
+    if (copy_from_user(&req, arg, sizeof(req))) return -EFAULT;
+    if (req.abi_version != DFM_PTE_RULES_ABI_VERSION || req.flags || req.reserved ||
+        !req.generation || req.count > DFM_PTE_MAX_POINTS ||
+        (!!req.count != !!req.rules)) return -EINVAL;
+    if (!ns_capable(&init_user_ns, CAP_SYS_PTRACE)) return -EPERM;
+    rules = kvcalloc(DFM_PTE_MAX_POINTS, sizeof(*rules), GFP_KERNEL);
+    if (!rules) return -ENOMEM;
+    if (req.count && copy_from_user(rules, u64_to_user_ptr(req.rules), req.count*sizeof(*rules))) {
+        kvfree(rules); return -EFAULT;
+    }
+    mutex_lock(&control_lock);
+    spin_lock_irqsave(&state_lock, flags);
+    if (!session) rc = -ENOENT;
+    else if (session->owner != owner) rc = -EACCES;
+    else if (session->snapshot.generation != req.generation) rc = -ESTALE;
+    else if (!session->active) rc = -ESRCH;
+    else rc = dfm_pte_validate_rules(&req, rules, session->snapshot.addresses,
+                                    session->snapshot.point_count, TASK_SIZE, fpsimd_write_ready());
+    if (!rc) {
+        session->rules_active = false;
+        ++session->rules_revision;
+    }
+    spin_unlock_irqrestore(&state_lock, flags);
+    if (!rc) {
+        /* Drain old in-flight replacements without holding the state spinlock.
+         * control_lock keeps this exact session alive across the rendezvous. */
+        synchronize_srcu(&patch_srcu);
+        spin_lock_irqsave(&state_lock, flags);
+        if (!session->active) rc = -ESRCH;
+        else {
+            memcpy(session->rules, rules, sizeof(session->rules));
+            session->rule_count = req.count;
+            session->rules_active = req.count != 0;
+        }
+        spin_unlock_irqrestore(&state_lock, flags);
+    }
+    mutex_unlock(&control_lock);
+    kvfree(rules);
+    return rc;
+}
+
 long dfm_pte_clear(struct file *owner)
 {
     int rc = 0;
@@ -865,6 +986,7 @@ long dfm_pte_info(void __user *arg)
 }
 long dfm_pte_set(struct file *owner, void __user *arg) { return -EOPNOTSUPP; }
 long dfm_pte_read(struct file *owner, void __user *arg) { return -EOPNOTSUPP; }
+long dfm_pte_rules(struct file *owner, void __user *arg) { return -EOPNOTSUPP; }
 long dfm_pte_clear(struct file *owner) { return -EOPNOTSUPP; }
 void dfm_pte_release(struct file *owner) {}
 void dfm_pte_exit(void) {}

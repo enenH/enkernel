@@ -57,10 +57,68 @@ kernels. This includes lazy CPU ownership and the low-128-bit view of saved
 SVE/SME state; raw thread cache copies are not accepted as live vector snapshots.
 If the synchronization helper(s) or hardware support are absent, fp_status is
 EOPNOTSUPP. A session change during synchronization reports ESTALE for the vector
-fields. No FPSIMD register is written by the recorder. Full SVE/SME scalable
+fields. The recorder is read-only unless persistent rules are configured. Full SVE/SME scalable
 registers, predicates, ZA and FPMR are not part of this ABI.
 The capability bit advertises the ABI, not backend availability or exact module
 commit. INFO is read-only; it does not install fault hooks.
+
+## Persistent register-write rules
+
+RULES (ioctl 50, rules ABI 1) installs a bounded table in the existing owned
+session. Configure once, then every observed matching PC hit applies the selected
+constant register replacements inside the kernel before executing the original
+instruction. There is no per-hit ioctl, userspace stop/reply or network exchange.
+This avoids userspace round-trip latency; the page-fault, TLB and native-step
+overhead and the other-thread pass window still exist. It does not make tracing
+lossless or zero-cost.
+
+    // SET first, then READ once to obtain the exact session generation.
+    rc = dfm::pte_read(snapshot);
+    dfm_pte_rule rule{};
+    rule.address = executable_pc;
+    rule.x_mask = 1U << 0;  // replace X0; all unselected inputs stay zero
+    rule.x[0] = 123;
+    rule.q_mask = 1U << 0;  // replace all 128 bits of Q0
+    rule.q[0][0] = low_bits;
+    rule.q[0][1] = high_bits;
+    rc = dfm::pte_rules(snapshot.generation, &rule, 1);
+    // Controller may now sleep/work elsewhere; no communication per hit.
+    // Check record.patch_status: 0=no rule, 1=applied, negative errno=skipped.
+    rc = dfm::pte_rules(snapshot.generation, nullptr, 0); // remove only rules
+    rc = dfm::pte_clear(); // remove tracing and rules
+
+At most one rule per configured PC, up to 16 rules. X masks select X0-X30;
+Q masks select Q0-Q31 (whole 128-bit lanes). RULE_FPCR/RULE_FPSR select the two
+32-bit control/status values. PC, SP, PSTATE, arbitrary memory, callbacks and
+user bytecode are not writable through this API. Bits outside the masks, unused
+values, duplicate PCs, unknown flags and non-session addresses are rejected.
+The ioctl requires CAP_SYS_PTRACE in init_user_ns, the same file description
+as SET, and the exact snapshot generation. A fresh process/PID reuse cannot
+reuse old rules. A failed validation leaves the old configuration unchanged.
+
+INFO_WRITE_GPR advertises rule support; INFO_WRITE_FPSIMD additionally requires
+the capture backend and dynamically resolved fpsimd_flush_task_state and
+fpsimd_update_current_state. Vector/control rules are rejected at configuration
+time if those helpers/hardware are unavailable. On a later capture failure or
+rule/session change, the complete rule is skipped (including X replacements),
+and patch_status reports the negative errno. GPR-only rules still work without
+FPSIMD. Records always describe the input state before replacements; the original
+instruction can itself overwrite selected registers afterwards.
+
+Vector writes use a synchronized, masked copy of the full user state. Outside
+the state spinlock, bottom halves are excluded, CPU ownership is invalidated,
+and the kernel update helper installs the saved/SVE-compatible replacement.
+This supports both old immediate-load and newer saved-state-only helper behavior.
+No stale CPU image is allowed to overwrite the new saved state on EL0 return.
+
+Rule replacement first disables the old table, drains in-flight writes with a
+dedicated SRCU domain, then publishes the new table. Tracing continues during
+this short no-rule interval. CLEAR/final file release also drains pending writes
+before freeing the session. Consequently no old-table write happens after the
+replace/remove/CLEAR call returns. Configuration is persistent only for that live
+session: it is not saved to disk, does not survive final FD close/exec/mm loss,
+and does not run after reboot. Keep an owned FD open; a per-command process that
+exits and closes its last FD will remove the session and rules.
 
 ## Execution and lifetime
 
@@ -143,6 +201,12 @@ stale PFNs, invalidation during a step, wrong mm/fault type, existing stepping,
 exclusive rejection, bounds and ring overflow. Vector cases verify all Q halves,
 FPCR/FPSR, live state synchronization instead of stale saved bytes, split SVE
 conversion, missing helpers/hardware and no captures for unrequested PCs.
+The same model executes the production RULES ioctl, validates owner/capability,
+session generation, masks, reserved values and addresses, and runs 200 autonomous
+masked replacements with one configuration for each old/new FP update model.
+It checks pre-write snapshots, unselected-register preservation, whole-rule skip
+on capture/configuration races, GPR-only operation without FP, rule removal,
+and target exit during the replacement rendezvous.
 Both legacy and 6.18 routing
 run at O0/O2, including foreign frames, wrong syndrome/mode, unowned events,
 entry-LR preservation, registration errors and cleanup. Source-tree detection
@@ -154,7 +218,9 @@ Build with ENKERNEL_BUILD_TESTS=ON and run dfm_pte_check as root on an authorize
 device with the matching module already loaded. The fixture is a forked child's
 own private, relocation-free vector-load/ADD/vector-store page. It verifies two
 batches of exact persistent hits and GPR/Q0-Q31/FPCR/FPSR snapshots on an otherwise
-isolated child, native results, unchanged code, unchanged vector/control state,
+isolated child, native results, unchanged code, unchanged vector/control state
+without rules, two 100-hit persistent-write batches separated by rule replacement,
+and restored original behavior after rule removal,
 bounded ring behavior and clear/retry. Unsupported/old modules return exit 77
 (skip), never a pass. This test never loads/unloads modules or changes SELinux.
 Six-KMI CI requires the native backend on every ABI and checks that 6.18 includes

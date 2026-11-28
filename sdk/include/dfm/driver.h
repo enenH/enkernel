@@ -92,6 +92,10 @@ namespace dfm {
     long pte_set(int pid, const uint64_t* addresses, size_t count);
     // ABI 2: q[32][2]/fpcr/fpsr are valid only when record.fp_status == 0.
     long pte_read(dfm_pte_snapshot& out);
+    /* Replace persistent rules once; no per-hit communication. generation is
+     * the current READ snapshot's generation. nullptr/count=0 removes rules.
+     * Rules live only as long as the owned PTE session (not across final close). */
+    long pte_rules(uint64_t generation, const dfm_pte_rule* rules, size_t count);
     long pte_clear();
     /* Raw result of the most recent issued ioctl on this thread (negative errno).
      * Argument validation can fail before issuing an ioctl; do not rely on libc errno. */

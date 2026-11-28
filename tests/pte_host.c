@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "abi.h"
 #include "pte_bp_policy.h"
@@ -30,6 +31,10 @@ typedef int spinlock_t;
 #define ESR_ELx_EC_SOFTSTP_LOW 0x32
 #define __nocfi
 #define NOKPROBE_SYMBOL(name)
+#define __user
+#define TASK_SIZE (1ULL << 48)
+#define GFP_KERNEL 0
+#define CAP_SYS_PTRACE 19
 #define ESR_ELx_FSC 0x3f
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x, v) ((x) = (v))
@@ -78,6 +83,22 @@ static int register_kprobe(struct kprobe *probe)
 static void unregister_kprobe(struct kprobe *probe) { assert(probe == &softstep_probe); ++unregistrations; }
 #endif
 static struct task_struct *current;
+static int patch_srcu, srcu_readers, syncs, bh_depth, flush_calls, update_calls;
+static void (*on_sync)(void);
+static int srcu_read_lock(int *s) { (void)s; ++srcu_readers; return 0; }
+static void srcu_read_unlock(int *s, int index) { (void)s; (void)index; assert(srcu_readers); --srcu_readers; }
+static void synchronize_srcu(int *s) { (void)s; assert(!srcu_readers); ++syncs; if(on_sync)on_sync(); }
+static void local_bh_disable(void) { ++bh_depth; }
+static void local_bh_enable(void) { assert(bh_depth==1); --bh_depth; }
+static int control_lock, init_user_ns;
+static bool ptrace_capable = true;
+static bool ns_capable(int *ns, int cap) { (void)ns; (void)cap; return ptrace_capable; }
+static void mutex_lock(int *lock) { assert(!*lock); ++*lock; }
+static void mutex_unlock(int *lock) { assert(*lock==1); --*lock; }
+static void *kvcalloc(size_t n, size_t size, int flags) { (void)flags; return calloc(n,size); }
+static void kvfree(void *p) { free(p); }
+static unsigned long copy_from_user(void *out, const void *in, size_t n) { if(!in)return n;memcpy(out,in,n);return 0; }
+#define u64_to_user_ptr(p) ((void *)(uintptr_t)(p))
 static struct user_fpsimd_state live_fp;
 static bool supports_fp = true;
 static int preserve_calls;
@@ -88,6 +109,20 @@ static void preserve_mock(void) {
 }
 static void (*preserve_user_fpsimd)(void) = preserve_mock;
 static void (*sync_user_fpsimd)(struct task_struct *);
+static bool fp_foreign;
+static bool update_saved_only;
+static void flush_fp_mock(struct task_struct *t) { (void)t; assert(bh_depth); fp_foreign=true; ++flush_calls; }
+static void update_fp_mock(const struct user_fpsimd_state *fp) {
+    assert(bh_depth && fp_foreign);
+    current->thread.uw.fpsimd_state=*fp;
+    if (!update_saved_only) { live_fp=*fp; fp_foreign=false; }
+    ++update_calls;
+}
+static void el0_restore_mock(void) {
+    if(fp_foreign){live_fp=current->thread.uw.fpsimd_state;fp_foreign=false;}
+}
+static void (*update_user_fpsimd)(const struct user_fpsimd_state *)=update_fp_mock;
+static void (*flush_user_fpsimd)(struct task_struct *)=flush_fp_mock;
 static struct user_fpsimd_state saved_sve;
 static int sync_calls;
 static void preserve_sve_mock(void) { ++preserve_calls; saved_sve = live_fp; }
@@ -127,6 +162,11 @@ static void preserve_and_change_generation(void) {
     preserve_mock();
     ++session->snapshot.generation;
 }
+static void preserve_and_change_rules(void) {
+    preserve_mock();
+    ++session->rules_revision;
+}
+static void exit_during_rules_drain(void) { session->active=false; }
 
 static struct pte_session state;
 static struct mm_struct mm;
@@ -139,14 +179,20 @@ static void reset(void)
     memset(&task, 0, sizeof(task)); memset(&regs, 0, sizeof(regs));
     memset(&code, 0, sizeof(code));
     task.mm = &mm; task.pid = 10; task.tid = 11;
+    static struct file owner={1};state.owner=&owner;
     current = &task; session = &state; state.mm = &mm; state.active = true;
     state.pages = 1; state.page[0].address = PAGE_SIZE;
     state.page[0].original = 0x1001; state.page[0].valid = true;
     state.page[0].page = &code; mm.entries[0] = 0x1001;
     state.snapshot.point_count = 1; state.snapshot.addresses[0] = PAGE_SIZE;
+    state.snapshot.generation=1;
     regs.pc = PAGE_SIZE; regs.sp = 0x1234; regs.regs[5] = 0x5566;
     preserve_calls = 0; supports_fp = true; preserve_user_fpsimd = preserve_mock;
     sync_user_fpsimd = NULL; sync_calls = 0;
+    flush_user_fpsimd=flush_fp_mock;update_user_fpsimd=update_fp_mock;
+    assert(!srcu_readers && !bh_depth && !control_lock);
+    syncs=flush_calls=update_calls=0;fp_foreign=false;ptrace_capable=true;
+    update_saved_only=false;on_sync=NULL;
     memset(&live_fp, 0, sizeof(live_fp));
     for (unsigned n = 0; n < 32; ++n)
         live_fp.vregs[n] = ((unsigned __int128)(0x123456789abcdef0ULL + n) << 64) |
@@ -154,6 +200,74 @@ static void reset(void)
     live_fp.fpcr = 0x00400000; live_fp.fpsr = 0x08000001;
     ((u32 *)code.data)[0] = 0xd503201f; // NOP
     assert(set_armed(&mm, &state.page[0], true) == 0);
+}
+static void persistent_rules(bool saved_only)
+{
+    struct dfm_pte_rule rule = { .address=PAGE_SIZE, .x_mask=1U | (1U<<30),
+        .q_mask=1U | (1U<<31), .flags=DFM_PTE_RULE_FPCR | DFM_PTE_RULE_FPSR };
+    struct dfm_pte_rules_req req={ .abi_version=DFM_PTE_RULES_ABI_VERSION,
+        .generation=1, .rules=(uintptr_t)&rule, .count=1 };
+    struct file outsider={2};
+    rule.x[0]=123;rule.x[30]=456;
+    rule.q[0][0]=0x1111222233334444ULL;rule.q[0][1]=0x5555666677778888ULL;
+    rule.q[31][0]=0x9999aaaabbbbccccULL;rule.q[31][1]=0xddddeeeeffff0000ULL;
+    rule.fpcr=0x00400000;rule.fpsr=2;
+    reset();
+    update_saved_only=saved_only;
+    assert(dfm_pte_rules(&outsider,&req)==-EACCES && !state.rule_count);
+    req.generation=2;assert(dfm_pte_rules(state.owner,&req)==-ESTALE);req.generation=1;
+    ptrace_capable=false;assert(dfm_pte_rules(state.owner,&req)==-EPERM);ptrace_capable=true;
+    rule.x_mask|=1U<<31;assert(dfm_pte_rules(state.owner,&req)==-EINVAL);rule.x_mask&=~(1U<<31);
+    rule.x[1]=1;assert(dfm_pte_rules(state.owner,&req)==-EINVAL);rule.x[1]=0;
+    rule.q[1][1]=1;assert(dfm_pte_rules(state.owner,&req)==-EINVAL);rule.q[1][1]=0;
+    rule.address+=4;assert(dfm_pte_rules(state.owner,&req)==-ENOENT);rule.address-=4;
+    rule.flags|=4;assert(dfm_pte_rules(state.owner,&req)==-EINVAL);rule.flags&=~4U;
+    flush_user_fpsimd=NULL;assert(dfm_pte_rules(state.owner,&req)==-EOPNOTSUPP);flush_user_fpsimd=flush_fp_mock;
+    struct dfm_pte_rule duplicate[2]={rule,rule};req.rules=(uintptr_t)duplicate;req.count=2;
+    assert(dfm_pte_rules(state.owner,&req)==-EEXIST);req.rules=(uintptr_t)&rule;req.count=1;
+    assert(dfm_pte_rules(state.owner,&req)==0 && state.rules_active && syncs==1);
+    rule.flags|=4;assert(dfm_pte_rules(state.owner,&req)==-EINVAL);rule.flags&=~4U;
+    assert(state.rules[0].x[0]==123 && state.rules_active && syncs==1);
+    const struct user_fpsimd_state before=live_fp;
+    for(unsigned n=0;n<200;++n) {
+        live_fp=before;regs.regs[0]=n;regs.regs[30]=n+1000;
+        assert(handle_fault(regs.pc,syndrome,&regs));
+        el0_restore_mock(); // New kernels reload saved state before original EL0 instruction.
+        const struct dfm_pte_record *r=&state.snapshot.records[n%64];
+        assert(r->x[0]==n && r->x[30]==n+1000 && r->patch_status==DFM_PTE_PATCH_APPLIED);
+        assert(!memcmp(r->q,before.vregs,sizeof(r->q)) && r->fpcr==before.fpcr && r->fpsr==before.fpsr);
+        assert(regs.regs[0]==123 && regs.regs[30]==456 && regs.regs[5]==0x5566);
+        assert(!memcmp(&live_fp.vregs[0],rule.q[0],16) && !memcmp(&live_fp.vregs[31],rule.q[31],16));
+        for(unsigned i=1;i<31;++i)assert(live_fp.vregs[i]==before.vregs[i]);
+        assert(live_fp.fpcr==rule.fpcr && live_fp.fpsr==rule.fpsr);
+        assert(regs.pc==PAGE_SIZE && regs.sp==0x1234);
+        cancel_current(&regs);
+    }
+    assert(update_calls==200 && flush_calls==200 && syncs==1); // One config, no per-hit RPC.
+    req.count=0;req.rules=0;assert(dfm_pte_rules(state.owner,&req)==0 && !state.rules_active && syncs==2);
+    regs.regs[0]=9;assert(handle_fault(regs.pc,syndrome,&regs));
+    assert(regs.regs[0]==9 && !state.snapshot.records[200%64].patch_status && update_calls==200);
+    cancel_current(&regs);
+    req.count=1;req.rules=(uintptr_t)&rule;assert(dfm_pte_rules(state.owner,&req)==0);
+    preserve_user_fpsimd=NULL;regs.regs[0]=42;
+    assert(handle_fault(regs.pc,syndrome,&regs));
+    assert(regs.regs[0]==42 && state.snapshot.records[201%64].patch_status==-EOPNOTSUPP);
+    cancel_current(&regs);
+    preserve_user_fpsimd=preserve_and_change_rules;regs.regs[0]=43;
+    assert(handle_fault(regs.pc,syndrome,&regs));
+    assert(regs.regs[0]==43 && state.snapshot.records[202%64].patch_status==-ESTALE);
+    cancel_current(&regs);
+    // GPR-only rules work without an FPSIMD backend.
+    rule=(struct dfm_pte_rule){ .address=PAGE_SIZE,.x_mask=1 };rule.x[0]=7;
+    preserve_user_fpsimd=NULL;assert(dfm_pte_rules(state.owner,&req)==0);
+    assert(handle_fault(regs.pc,syndrome,&regs));assert(regs.regs[0]==7 && update_calls==200);
+    cancel_current(&regs);
+    on_sync=exit_during_rules_drain;
+    assert(dfm_pte_rules(state.owner,&req)==-ESRCH && !state.rules_active);
+    on_sync=NULL;
+    state.active=false;assert(dfm_pte_rules(state.owner,&req)==-ESRCH);
+    session=NULL;assert(dfm_pte_rules(&outsider,&req)==-ENOENT);
+    puts("PTE persistent register rules passed: 200 autonomous masked writes, pre-write records, ownership/generation, replace/remove and all-or-none failure");
 }
 int main(void)
 {
@@ -303,6 +417,8 @@ int main(void)
     task_exit(NULL, &task);
 #endif
     assert(!task.step && !task.refs && state.page[0].armed);
+    persistent_rules(false);
+    persistent_rules(true);
     puts("PTE production fault/step/notifier and synchronized Q0-Q31/FPCR/FPSR model passed");
     return 0;
 }

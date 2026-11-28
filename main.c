@@ -49,6 +49,8 @@ static long drv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         return dfm_pte_set(filp, argp);
     case DFM_IOCTL_PTE_READ:
         return dfm_pte_read(filp, argp);
+    case DFM_IOCTL_PTE_RULES:
+        return dfm_pte_rules(filp, argp);
     case DFM_IOCTL_PTE_CLEAR:
         return dfm_pte_clear(filp);
     case MEM_IOC_CAPABILITIES:

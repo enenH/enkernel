@@ -24,6 +24,7 @@ source += section('/* PTE_STEP_REGISTRATION_BEGIN */', '/* PTE_STEP_REGISTRATION
 source += section('/* Called in the user-fault task context', '#define FAULT_WRAPPER')
 source += section('static void cancel_current(', 'static void task_fork(')
 source += section('static int invalidate_start(', 'static const struct mmu_notifier_ops')
+source += section('long dfm_pte_rules(', 'long dfm_pte_clear(')
 with tempfile.TemporaryDirectory(prefix='dfm-pte-') as directory:
     directory = Path(directory)
     if sys.platform == 'win32':

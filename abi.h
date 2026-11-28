@@ -65,6 +65,7 @@
 #define DFM_IOCTL_PTE_SET        _IOW('D', 47, struct dfm_pte_set_req)
 #define DFM_IOCTL_PTE_READ       _IOWR('D', 48, struct dfm_pte_read_req)
 #define DFM_IOCTL_PTE_CLEAR      _IO('D', 49)
+#define DFM_IOCTL_PTE_RULES      _IOW('D', 50, struct dfm_pte_rules_req)
 
 #define DFM_CAPABILITIES_ABI_VERSION 1U
 #define DFM_CAP_FUTEX_THREADS    (1ULL << 0)
@@ -92,7 +93,8 @@ struct dfm_capabilities_req {
  * Mapping invalidation disarms affected pages. Unsupported exclusive/atomic
  * instructions disarm a page rather than disturb its reservation semantics.
  * ABI 2 adds synchronized Q0-Q31/FPCR/FPSR. fp_status must be zero before
- * using vector values. No instruction bytes or register values change.
+ * using vector values. Optional file-owned rules can replace selected X/Q
+ * values before the original instruction without a per-hit userspace exchange.
  * SET requires CAP_SYS_PTRACE in init_user_ns and target ptrace permission.
  * INFO reports runtime backend availability; the capability bit names the ABI.
  */
@@ -103,6 +105,12 @@ struct dfm_capabilities_req {
 #define DFM_PTE_INFO_AVAILABLE (1U << 0)
 #define DFM_PTE_INFO_STEP_WINDOW (1U << 1)
 #define DFM_PTE_INFO_FPSIMD (1U << 2)
+#define DFM_PTE_INFO_WRITE_GPR (1U << 3)
+#define DFM_PTE_INFO_WRITE_FPSIMD (1U << 4)
+#define DFM_PTE_RULES_ABI_VERSION 1U
+#define DFM_PTE_RULE_FPCR (1U << 0)
+#define DFM_PTE_RULE_FPSR (1U << 1)
+#define DFM_PTE_PATCH_APPLIED 1
 #define DFM_PTE_ACTIVE (1U << 0)
 #define DFM_PTE_INVALIDATED (1U << 1)
 struct dfm_pte_info_req {
@@ -125,7 +133,8 @@ struct dfm_pte_record {
     uint64_t q[32][2]; /* q[n][0]: low 64 bits, q[n][1]: high 64 bits */
     uint32_t fpcr, fpsr;
     int32_t fp_status; /* 0: synchronized user FPSIMD; negative errno: unavailable */
-    uint32_t reserved;
+    int32_t patch_status; /* 0: no rule; 1: applied; negative errno: not applied.
+                          * Reuses ABI-2 reserved word, preserving record layout. */
 };
 /* Non-destructive, oldest-to-newest bounded snapshot. dropped counts records
  * overwritten by the ring; it does not count unobservable concurrent passes.
@@ -144,6 +153,29 @@ struct dfm_pte_read_req {
     uint32_t abi_version, reserved;
     uint64_t buf, buf_size, out_size;
     uint64_t reserved2;
+};
+/* Persistent constant register replacements, at most one per configured PC.
+ * Masks select full X0-X30 / 128-bit Q0-Q31; flags select FPCR/FPSR. Unselected
+ * values and reserved fields must be zero. No PC/SP/PSTATE or memory writes.
+ * RULES atomically replaces all rules in the existing owned session. count=0
+ * with rules=0 removes them. generation must match the READ snapshot; stale
+ * sessions cannot be reconfigured by PID reuse. New rules affect subsequent
+ * hits, with no userspace wait. CLEAR/final FD close removes all rules.
+ * Rules are not persisted to disk and do not survive session loss/reboot.
+ * An in-flight write from the prior configuration is drained before RULES or
+ * CLEAR returns. Q/FP writes require the write-FPSIMD backend at configuration
+ * time and a successful synchronized capture on each hit; otherwise the whole
+ * rule is skipped, including its X writes. Records describe pre-write state. */
+struct dfm_pte_rule {
+    uint64_t address;
+    uint32_t x_mask, q_mask, flags, reserved;
+    uint64_t x[31], q[32][2];
+    uint32_t fpcr, fpsr;
+};
+struct dfm_pte_rules_req {
+    uint32_t abi_version, flags;
+    uint64_t generation, rules;
+    uint32_t count, reserved;
 };
 
 /* Read-only regular-file operations addressed by target PID/FD. The driver fd
