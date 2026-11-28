@@ -102,6 +102,16 @@ lifetime or ownership: the controller must invalidate the rule when its object
 changes, is freed, or the target context expires. A predicate alone with no
 replacement is rejected. Old modules reject this new flag instead of treating
 the predicate value as a replacement.
+
+INFO_PROBABILITY advertises per-hit probabilistic rules. With RULE_PROBABILITY,
+the former reserved word contains an integer percentage 0..100. Each matching
+hit samples get_random_u32 in the driver and compares its multiply-high 0..99
+bucket to that percentage. Zero never writes; 100 always writes. Skipped hits
+retain every register and report patch_status=0; selected hits retain the usual
+all-or-none write semantics. This is per observed function invocation (so
+multiple projectile/pellet calls are independent), not per render frame.
+Old modules reject the flag; clients must query INFO_PROBABILITY. Without the
+flag the reserved word must still be zero. No ABI size/version changes.
 The ioctl requires CAP_SYS_PTRACE in init_user_ns, the same file description
 as SET, and the exact snapshot generation. A fresh process/PID reuse cannot
 reuse old rules. A failed validation leaves the old configuration unchanged.

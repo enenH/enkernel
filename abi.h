@@ -108,10 +108,12 @@ struct dfm_capabilities_req {
 #define DFM_PTE_INFO_WRITE_GPR (1U << 3)
 #define DFM_PTE_INFO_WRITE_FPSIMD (1U << 4)
 #define DFM_PTE_INFO_MATCH_X0 (1U << 5)
+#define DFM_PTE_INFO_PROBABILITY (1U << 6)
 #define DFM_PTE_RULES_ABI_VERSION 1U
 #define DFM_PTE_RULE_FPCR (1U << 0)
 #define DFM_PTE_RULE_FPSR (1U << 1)
 #define DFM_PTE_RULE_MATCH_X0 (1U << 2)
+#define DFM_PTE_RULE_PROBABILITY (1U << 3)
 #define DFM_PTE_PATCH_APPLIED 1
 #define DFM_PTE_ACTIVE (1U << 0)
 #define DFM_PTE_INVALIDATED (1U << 1)
@@ -174,7 +176,7 @@ struct dfm_pte_read_req {
  * query INFO_MATCH_X0 before use. The ABI layout/version is unchanged. */
 struct dfm_pte_rule {
     uint64_t address;
-    uint32_t x_mask, q_mask, flags, reserved;
+    uint32_t x_mask, q_mask, flags, reserved; /* PROBABILITY: reserved is percent 0..100; otherwise zero */
     uint64_t x[31], q[32][2];
     uint32_t fpcr, fpsr;
 };

@@ -63,6 +63,8 @@ struct step_hook { int (*fn)(struct pt_regs *, unsigned long); };
 typedef uint32_t kprobe_opcode_t;
 struct kprobe { kprobe_opcode_t *addr; int (*pre_handler)(struct kprobe *, struct pt_regs *); };
 static struct pt_regs regs;
+static uint32_t random_sample;
+static uint32_t get_random_u32(void) { return random_sample; }
 static struct pt_regs *task_pt_regs(struct task_struct *task) { (void)task; return &regs; }
 #define instruction_pointer_set(r, value) ((r)->pc = (value))
 #ifdef DFM_PTE_USER_STEP_HOOK
@@ -221,12 +223,12 @@ static void persistent_rules(bool saved_only)
     rule.x[1]=1;assert(dfm_pte_rules(state.owner,&req)==-EINVAL);rule.x[1]=0;
     rule.q[1][1]=1;assert(dfm_pte_rules(state.owner,&req)==-EINVAL);rule.q[1][1]=0;
     rule.address+=4;assert(dfm_pte_rules(state.owner,&req)==-ENOENT);rule.address-=4;
-    rule.flags|=8;assert(dfm_pte_rules(state.owner,&req)==-EINVAL);rule.flags&=~8U;
+    rule.flags|=16;assert(dfm_pte_rules(state.owner,&req)==-EINVAL);rule.flags&=~16U;
     flush_user_fpsimd=NULL;assert(dfm_pte_rules(state.owner,&req)==-EOPNOTSUPP);flush_user_fpsimd=flush_fp_mock;
     struct dfm_pte_rule duplicate[2]={rule,rule};req.rules=(uintptr_t)duplicate;req.count=2;
     assert(dfm_pte_rules(state.owner,&req)==-EEXIST);req.rules=(uintptr_t)&rule;req.count=1;
     assert(dfm_pte_rules(state.owner,&req)==0 && state.rules_active && syncs==1);
-    rule.flags|=8;assert(dfm_pte_rules(state.owner,&req)==-EINVAL);rule.flags&=~8U;
+    rule.flags|=16;assert(dfm_pte_rules(state.owner,&req)==-EINVAL);rule.flags&=~16U;
     assert(state.rules[0].x[0]==123 && state.rules_active && syncs==1);
     const struct user_fpsimd_state before=live_fp;
     for(unsigned n=0;n<200;++n) {
@@ -304,6 +306,25 @@ static void predicate_rules(bool saved_only)
 }
 int main(void)
 {
+    {
+        struct dfm_pte_rule rule={ .address=PAGE_SIZE,.q_mask=1U<<3,.flags=DFM_PTE_RULE_PROBABILITY,.reserved=25 };
+        struct dfm_pte_rules_req req={ .abi_version=DFM_PTE_RULES_ABI_VERSION,.generation=1,.rules=(uintptr_t)&rule,.count=1 };
+        reset();rule.q[3][0]=0x3f800000;
+        rule.reserved=101;assert(dfm_pte_rules(state.owner,&req)==-EINVAL);rule.reserved=25;
+        assert(dfm_pte_rules(state.owner,&req)==0);
+        const struct user_fpsimd_state before=live_fp;
+        for(unsigned n=0;n<40;++n) {
+            random_sample=(n%4)*0x40000000U;live_fp=before;
+            assert(handle_fault(regs.pc,syndrome,&regs));el0_restore_mock();
+            assert(state.snapshot.records[n%64].patch_status==(n%4==0?1:0));
+            if(n%4)assert(!memcmp(&live_fp,&before,sizeof(before)));
+            cancel_current(&regs);
+        }
+        assert(update_calls==10);
+        rule.reserved=0;assert(!dfm_pte_probability_pass(&rule,0));
+        rule.reserved=100;assert(dfm_pte_probability_pass(&rule,UINT32_MAX));
+        puts("PTE probability passed: per-hit selection, skipped state preserved, 0/100 endpoints and invalid percentage");
+    }
     assert(step_register_call(true) == 0 && registrations == 1);
     assert(step_register_call(false) == 0 && unregistrations == 1);
 #ifdef DFM_PTE_SOFTSTEP_KPROBE

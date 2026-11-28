@@ -12,6 +12,7 @@
 #include <linux/mutex.h>
 #include <linux/pid.h>
 #include <linux/ptrace.h>
+#include <linux/random.h>
 #include <linux/rcupdate.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/signal.h>
@@ -434,6 +435,8 @@ static bool handle_fault(unsigned long far, unsigned long esr,
         else if (!dfm_pte_rule_matches(&rule, regs->regs[0])) patch_status = 0;
         else if (dfm_pte_rule_uses_fp(&rule) && fp_status) patch_status = fp_status;
         else if (dfm_pte_rule_uses_fp(&rule) && !fpsimd_write_ready()) patch_status = -EOPNOTSUPP;
+        else if ((rule.flags & DFM_PTE_RULE_PROBABILITY) &&
+                 !dfm_pte_probability_pass(&rule, rule.reserved == 0 ? 0 : get_random_u32())) patch_status = 0;
         else patch_status = DFM_PTE_PATCH_APPLIED;
     }
     record_hit(s, pc, regs, &fp, fp_status, patch_status);
@@ -770,7 +773,7 @@ long dfm_pte_info(void __user *arg)
     backend_error = resolve_backend();
     req.flags = DFM_PTE_INFO_STEP_WINDOW | (!backend_error ? DFM_PTE_INFO_AVAILABLE : 0);
     if (preserve_user_fpsimd && system_supports_fpsimd()) req.flags |= DFM_PTE_INFO_FPSIMD;
-    if (!backend_error) req.flags |= DFM_PTE_INFO_WRITE_GPR | DFM_PTE_INFO_MATCH_X0;
+    if (!backend_error) req.flags |= DFM_PTE_INFO_WRITE_GPR | DFM_PTE_INFO_MATCH_X0 | DFM_PTE_INFO_PROBABILITY;
     if (fpsimd_write_ready()) req.flags |= DFM_PTE_INFO_WRITE_FPSIMD;
     req.backend_errno = backend_error;
     mutex_unlock(&control_lock);

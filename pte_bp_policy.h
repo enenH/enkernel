@@ -44,6 +44,11 @@ static inline int dfm_pte_rule_matches(const struct dfm_pte_rule *r, uint64_t x0
 {
     return !(r->flags & DFM_PTE_RULE_MATCH_X0) || r->x[0] == x0;
 }
+static inline int dfm_pte_probability_pass(const struct dfm_pte_rule *r, uint32_t random)
+{
+    return !(r->flags & DFM_PTE_RULE_PROBABILITY) ||
+           (((uint64_t)random * 100U) >> 32) < r->reserved;
+}
 static inline int dfm_pte_validate_rules(const struct dfm_pte_rules_req *req,
                                         const struct dfm_pte_rule *rules,
                                         const uint64_t *points, unsigned int count,
@@ -56,8 +61,9 @@ static inline int dfm_pte_validate_rules(const struct dfm_pte_rules_req *req,
     for (i = 0; i < req->count; ++i) {
         const struct dfm_pte_rule *r = &rules[i];
         if (!r->address || (r->address & 3) || r->address >= limit || limit-r->address < 4 ||
-            (r->x_mask & (1U << 31)) || r->reserved ||
-            (r->flags & ~(DFM_PTE_RULE_FPCR | DFM_PTE_RULE_FPSR | DFM_PTE_RULE_MATCH_X0)) ||
+            (r->x_mask & (1U << 31)) ||
+            ((r->flags & DFM_PTE_RULE_PROBABILITY) ? r->reserved > 100 : r->reserved != 0) ||
+            (r->flags & ~(DFM_PTE_RULE_FPCR | DFM_PTE_RULE_FPSR | DFM_PTE_RULE_MATCH_X0 | DFM_PTE_RULE_PROBABILITY)) ||
             !(r->x_mask || r->q_mask || (r->flags & (DFM_PTE_RULE_FPCR | DFM_PTE_RULE_FPSR)))) return -EINVAL;
         if ((r->flags & DFM_PTE_RULE_MATCH_X0) &&
             ((r->x_mask & 1U) || !r->x[0])) return -EINVAL;
