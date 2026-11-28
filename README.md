@@ -43,6 +43,40 @@ reported on teardown. The implementation follows the return-probe approach in
 
 ## Unload
 
-The DFM loader checks `/sys/module/dfm/parameters/unload_supported` for `Y`. It closes its driver handle and writes `1` to `/sys/module/dfm/parameters/prepare_unload` before requesting normal removal of `dfm`. The preparation parameter reads `Y` while new connections are paused, so a later loader run can finish a pending removal.
+Loading calls `kobject_del(&THIS_MODULE->mkobj.kobj)` after taking the module's
+lifetime reference. The loader-owned sysfs objects stay alive. An explicit root
+unload request restores their original attributes, parameters, sections, notes
+and holders directory; ordinary driver lookup and capability checks keep them
+detached.
+
+After stopping the overlay and other driver clients, run the userspace maintenance
+command and then normal removal:
+
+```sh
+adb shell su -c '/data/local/tmp/dfm_plus --prepare-module-unload'
+adb shell su -c 'rmmod dfm'
+```
+
+The command uses `DFM_MODULE_IOC_EXPOSE_UNLOAD`, closes its control handle, then
+checks `unload_supported` and writes `prepare_unload`. The ioctl requires
+`CAP_SYS_MODULE` and the last driver client. It pauses new connections while
+restoring sysfs. Restore failure rolls back the partial directory and reopens
+admission; successful restore leaves it paused for unload. The preparation
+parameter reads `Y` while connections are paused, so a later command can finish
+a pending preparation.
 
 Preparation returns an error while a driver client, process-memory session, legacy touch proxy, or queued touch release still needs the module. If restoring or draining a kernel hook fails, preparation keeps the module referenced and can be retried.
+
+## File observations for UDP callbacks
+
+The optional `DFM_CAP_FILE_OBSERVER` capability supplies invocation-scoped observer
+FDs. Their query ioctl returns file metadata and native `SEEK_DATA`/`SEEK_HOLE`
+results, with separate transport errors and guest errno. Pinned target file
+references provide opaque identities shared by duplicated FDs. Observers hold
+their parent driver client until release, so unload cannot overtake a query.
+
+Supported file-operation profiles follow `kernel_draw/io/kd_file.c`. F2FS sparse
+queries use a verified independent `O_PATH` cursor, preserving the target open
+file description's position. Unknown operations and unavailable helpers fail
+explicitly. The userspace emulator maintains its own positions; no query writes
+target process memory or advances the target FD.

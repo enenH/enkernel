@@ -60,12 +60,19 @@
 #define UDP_IOC_BIND_FD           _IOWR('D', 41, struct udp_cap_bind_req)
 #define MEM_IOC_CAPABILITIES      _IOWR('D', 42, struct dfm_capabilities_req)
 #define UDP_IOC_READ_V2           _IOWR('D', 44, struct udp_cap_read_v2_req)
+#define DFM_FILE_OBSERVER_IOC_OPEN _IOWR('D', 45, struct dfm_file_observer_open_req)
+/* Accepted only by the read-only observer fd returned by OPEN. */
+#define DFM_FILE_OBSERVER_IOC_QUERY _IOWR('D', 46, struct dfm_file_observer_query_req)
+/* Root-only unload request: restore sysfs, close this last driver handle,
+ * then use the normal prepare_unload parameter and delete_module. */
+#define DFM_MODULE_IOC_EXPOSE_UNLOAD _IO('D', 47)
 
 #define DFM_CAPABILITIES_ABI_VERSION 1U
 #define DFM_CAP_FUTEX_THREADS    (1ULL << 0)
 #define DFM_CAP_UDP_SOCKET_BIND  (1ULL << 1)
 #define DFM_CAP_UDP_CAPTURE_V2   (1ULL << 2)
 #define DFM_CAP_SF_AVC_BYPASS    (1ULL << 3)
+#define DFM_CAP_FILE_OBSERVER   (1ULL << 4)
 #define DFM_CAP_REQUIRED (DFM_CAP_FUTEX_THREADS | DFM_CAP_UDP_SOCKET_BIND | DFM_CAP_UDP_CAPTURE_V2)
 /* Read-only handshake. A version-0 request is rejected before any operation.
  * Features describe implemented transports, not a guarantee that every target
@@ -74,6 +81,32 @@ struct dfm_capabilities_req {
     uint32_t abi_version;
     uint32_t out_abi_version;
     uint64_t out_features;
+    uint64_t reserved[2];
+};
+
+#define DFM_FILE_OBSERVER_ABI_VERSION 1U
+#define DFM_FILE_OBSERVER_STAT 0U
+#define DFM_FILE_OBSERVER_SEEK_DATA 3U
+#define DFM_FILE_OBSERVER_SEEK_HOLE 4U
+#define DFM_FILE_OBSERVER_KIND_REGULAR 1U
+#define DFM_FILE_OBSERVER_KIND_DMA_BUF 2U
+
+struct dfm_file_observer_open_req {
+    uint32_t version;
+    int32_t pid, tid, out_fd;
+    uint64_t reserved[2];
+};
+
+/* Offsets are signed. A transport failure is an ioctl error. A successful
+ * observation of a native syscall failure returns a positive out_errno.
+ * Identity is local to the observer and shared by dup aliases. */
+struct dfm_file_observer_query_req {
+    uint32_t version, target_fd, op, reserved0;
+    int64_t offset;
+    uint64_t out_identity;
+    int64_t out_initial_position, out_size, out_max_size, out_position;
+    uint32_t out_kind;
+    int32_t out_errno;
     uint64_t reserved[2];
 };
 
@@ -199,7 +232,7 @@ struct mem_process_mem_arm_req {
  * soon as the query returns: never persist identities across emulated calls.
  * Equal PA does NOT imply shared write semantics for private/COW mappings.
  * -ENOENT: no VMA; -ENODATA: nonresident/inaccessible PTE;
- * -EOPNOTSUPP: special/IO/hugetlb mapping; -ENOTTY: old module.
+ * -EOPNOTSUPP: unsupported leaf memory type or hugetlb; -ENOTTY: old module.
  * All input flags/reserved fields must be zero. ABI is identical in user/. */
 struct mem_query_mapping_req {
     int32_t  pid;

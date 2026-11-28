@@ -4,6 +4,7 @@
 #include <linux/kernel.h>
 #include <linux/capability.h>
 #include <linux/completion.h>
+#include <linux/cred.h>
 #include <linux/jiffies.h>
 #include <linux/kallsyms.h>
 #include <linux/kprobes.h>
@@ -11,7 +12,6 @@
 #include <linux/ptrace.h>
 #include <linux/rcupdate.h>
 #include <linux/spinlock.h>
-#include <linux/version.h>
 #include <linux/anon_inodes.h>
 #include <linux/fdtable.h>
 #include <linux/file.h>
@@ -21,7 +21,6 @@
 #include <linux/task_work.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
-#include <linux/syscalls.h>
 #include <linux/workqueue.h>
 
 #include "abi.h"
@@ -38,6 +37,8 @@
 #include "sf_groups.h"
 #include "sf_avc.h"
 #include "futex.h"
+#include "file_observer.h"
+#include "module_sysfs.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("DFM");
@@ -84,6 +85,8 @@ static void install_put(void)
 
 /* ---- ioctl dispatcher ---- */
 
+static int expose_unload_controls(void);
+
 static long drv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
     void __user *argp = (void __user *)arg;
@@ -91,6 +94,10 @@ static long drv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     switch (cmd) {
     case MEM_IOC_CAPABILITIES:
         return dfm_capabilities(argp);
+    case DFM_FILE_OBSERVER_IOC_OPEN:
+        return dfm_file_observer_open(filp, argp);
+    case DFM_MODULE_IOC_EXPOSE_UNLOAD:
+        return expose_unload_controls();
     case MEM_IOC_FUTEX_WAITERS:
         return dfm_futex_waiters(filp, argp);
     case MEM_IOC_FUTEX_VALIDATE:
@@ -176,6 +183,9 @@ static long drv_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 static int drv_release(struct inode *inode, struct file *filp)
 {
+    if (filp->private_data != filp)
+        return 0;
+
     dfm_futex_release(filp);
     dfm_hwb_release_owner(filp);
     udp_capture_stop();
@@ -196,29 +206,9 @@ static int g_reboot_kprobe_registered;
 
 /* ---- fd installation ---- */
 
-static int install_fd(void)
-{
-    struct file *filp;
-    int fd;
-
-    fd = get_unused_fd_flags(O_CLOEXEC);
-    if (fd < 0)
-        return fd;
-
-    filp = anon_inode_getfile("[dfm]", &drv_fops, NULL,
-                              O_RDWR | O_CLOEXEC);
-    if (IS_ERR(filp)) {
-        put_unused_fd(fd);
-        return PTR_ERR(filp);
-    }
-
-    atomic_inc(&g_driver_files);
-    fd_install(fd, filp);
-    return fd;
-}
-
 int install_fd_to_user(int __user *outp)
 {
+    struct file *filp = NULL;
     int fd;
 
     if (!outp)
@@ -226,17 +216,33 @@ int install_fd_to_user(int __user *outp)
     if (!install_try_get())
         return -ESHUTDOWN;
 
-    fd = install_fd();
+    fd = get_unused_fd_flags(O_CLOEXEC);
+    if (fd < 0)
+        goto copy_result;
+
+    filp = anon_inode_getfile("[dfm]", &drv_fops, NULL,
+                              O_RDWR | O_CLOEXEC);
+    if (IS_ERR(filp)) {
+        put_unused_fd(fd);
+        fd = PTR_ERR(filp);
+        goto copy_result;
+    }
+
+copy_result:
+    /* Publish the fd only after delivering its number. A reserved fd cannot
+     * be closed and reused by another thread while copying the result. */
     if (copy_to_user(outp, &fd, sizeof(fd))) {
         pr_err("install fd copy_to_user failed\n");
         if (fd >= 0) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,11, 0)
-            close_fd(fd);
-#else
-            ksys_close(fd);
-#endif
+            put_unused_fd(fd);
+            fput(filp);
         }
         fd = -EFAULT;
+    } else if (fd >= 0) {
+        /* Only published files own client resources in drv_release(). */
+        filp->private_data = filp;
+        atomic_inc(&g_driver_files);
+        fd_install(fd, filp);
     }
 
     install_put();
@@ -270,6 +276,10 @@ static int reboot_handler_pre(struct kprobe *p, struct pt_regs *regs)
     int magic1, magic2;
     unsigned long arg4;
     struct install_tw *tw;
+
+    /* Apply the same caller restriction as syscall_install_handler(). */
+    if (current_uid().val > 1000)
+        return 0;
 
     /* ARM64 syscall wrapper: first arg is pointer to user pt_regs */
     real_regs = (struct pt_regs *)regs->regs[0];
@@ -315,6 +325,42 @@ static bool g_unload_work_queued;
 static bool g_unload_started;
 static bool g_unload_prepared;
 static int g_unload_result;
+
+/* The caller explicitly requests an unload and owns its last driver handle.
+ * Restore the original sysfs controls, then let userspace close that handle
+ * before using prepare_unload. The existing zero-client gate still decides
+ * whether hooks can be detached and the lifetime reference can be released. */
+static int expose_unload_controls(void)
+{
+    const int *modules_disabled;
+    unsigned long flags;
+    bool busy;
+    bool was_accepting;
+    int ret;
+
+    if (!capable(CAP_SYS_MODULE))
+        return -EPERM;
+    if (READ_ONCE(THIS_MODULE->state) != MODULE_STATE_LIVE)
+        return -EBUSY;
+    modules_disabled = (const int *)kallsyms_lookup_name("modules_disabled");
+    if (modules_disabled && READ_ONCE(*modules_disabled))
+        return -EPERM;
+    mutex_lock(&g_unload_lock);
+    spin_lock_irqsave(&g_install_lock, flags);
+    was_accepting = g_accept_installs;
+    busy = g_install_users || atomic_read(&g_driver_files) != 1;
+    if (!busy)
+        g_accept_installs = false;
+    spin_unlock_irqrestore(&g_install_lock, flags);
+    if (busy || process_mem_in_use() || touch_v2_has_pending_events())
+        ret = -EBUSY;
+    else
+        ret = dfm_module_sysfs_restore_for_unload();
+    if (ret && !busy)
+        set_install_admission(was_accepting);
+    mutex_unlock(&g_unload_lock);
+    return ret;
+}
 
 static int stop_new_installs(void)
 {
@@ -386,7 +432,11 @@ static int prepare_unload_set(const char *value, const struct kernel_param *para
     if (READ_ONCE(THIS_MODULE->state) != MODULE_STATE_LIVE)
         return -EBUSY;
 
-    mutex_lock(&g_unload_lock);
+    /* sysfs restore publishes this callback while holding g_unload_lock.
+     * A failed restore removes that group and drains active callbacks, so
+     * waiting here would deadlock its rollback. Concurrent requests retry. */
+    if (!mutex_trylock(&g_unload_lock))
+        return -EBUSY;
     ret = 0;
     if (g_unload_prepared)
         goto out;
@@ -450,6 +500,8 @@ static const struct kernel_param_ops unload_supported_ops = {
 module_param_cb(prepare_unload, &prepare_unload_ops, NULL, 0600);
 module_param_cb(unload_supported, &unload_supported_ops, NULL, 0444);
 
+#else
+static int expose_unload_controls(void) { return -EOPNOTSUPP; }
 #endif
 
 /* ---- module init/exit ---- */
@@ -532,9 +584,12 @@ static int __init mod_init(void)
 
     remove_inte_proc_entries();
 
-    /* Kernel-managed sysfs stays available for unload preparation. Hold a
-     * reference until preparation has restored and drained external hooks. */
+    /* Keep the loader-owned objects alive while sysfs is detached. Explicit
+     * unload preparation restores them before releasing the lifetime pin. */
     __module_get(THIS_MODULE);
+    ret = dfm_module_sysfs_detach();
+    if (ret)
+        pr_warn("module sysfs detach unavailable: %d\n", ret);
     set_install_admission(true);
 
     pr_info("module loaded, syscall_nr=%d reboot_fallback=%d\n",

@@ -1476,7 +1476,8 @@ static int mem_mapping_leaf(struct mem_query_mapping_req *req,
     if (vma->vm_flags & VM_WRITE) req->out_flags |= MEM_MAPPING_F_WRITE;
     if (vma->vm_flags & VM_EXEC) req->out_flags |= MEM_MAPPING_F_EXEC;
     /* A read-only MAP_SHARED file can clear VM_SHARED but retains MAYSHARE. */
-    if (vma->vm_flags & VM_MAYSHARE) req->out_flags |= MEM_MAPPING_F_SHARED;
+    if (vma->vm_flags & (VM_SHARED | VM_MAYSHARE))
+        req->out_flags |= MEM_MAPPING_F_SHARED;
     return 0;
 }
 
@@ -1484,27 +1485,33 @@ static int mem_mapping_locked(struct mm_struct *mm, unsigned long addr,
                               struct mem_query_mapping_req *req)
 {
     struct vm_area_struct *vma;
-    pgd_t *pgdp;
-    p4d_t *p4dp;
+    pgd_t *pgdp, pgd;
+    p4d_t *p4dp, p4d;
     pud_t *pudp, pud;
     pmd_t *pmdp, pmd;
     pte_t *ptep, pte;
     spinlock_t *ptl;
-    int ret;
+    int ret = -ENODATA;
 
     vma = find_vma(mm, addr);
     if (!vma || addr < vma->vm_start)
         return -ENOENT;
-    /* hugetlb has a different locking protocol; device memory is not RAM. */
-    if (vma->vm_flags & (VM_IO | VM_PFNMAP | VM_MIXEDMAP | VM_HUGETLB))
+    /* Hugetlb uses a different leaf locking protocol. Driver VMAs can also
+     * map normal memory. Inspect their locked leaf for identity without
+     * dereferencing the PFN, and reject device attributes in mem_mapping_leaf.
+     */
+    if (vma->vm_flags & VM_HUGETLB)
         return -EOPNOTSUPP;
 
+    rcu_read_lock();
     pgdp = pgd_offset(mm, addr);
-    if (pgd_none(READ_ONCE(*pgdp)) || pgd_bad(READ_ONCE(*pgdp)))
-        return -ENODATA;
+    pgd = READ_ONCE(*pgdp);
+    if (pgd_none(pgd) || pgd_bad(pgd))
+        goto out_rcu;
     p4dp = p4d_offset(pgdp, addr);
-    if (p4d_none(READ_ONCE(*p4dp)) || p4d_bad(READ_ONCE(*p4dp)))
-        return -ENODATA;
+    p4d = READ_ONCE(*p4dp);
+    if (p4d_none(p4d) || p4d_bad(p4d))
+        goto out_rcu;
     pudp = pud_offset(p4dp, addr);
     ptl = pud_lock(mm, pudp);
     pud = READ_ONCE(*pudp);
@@ -1512,38 +1519,29 @@ static int mem_mapping_locked(struct mm_struct *mm, unsigned long addr,
         ret = mem_mapping_leaf(req, vma, __pte(pud_val(pud)),
                 ((uint64_t)pud_pfn(pud) << PAGE_SHIFT) +
                     (addr & ~PUD_MASK), PUD_SIZE);
-        spin_unlock(ptl);
-        return ret;
+        goto out_ptl;
     }
-    ret = pud_none(pud) || pud_bad(pud);
-    spin_unlock(ptl);
-    if (ret)
-        return -ENODATA;
-
-    /* arm64 page tables are lowmem. Hold RCU from BEFORE sampling the PMD
-     * until after releasing the PTE lock, then recheck the parent under that
-     * lock. This is the lowmem pte_offset_map_lock protocol without depending
-     * on __pte_offset_map_lock (not exported to modules on newer kernels).
-     * On older kernels mmap_read_lock also prevents table removal. */
-    rcu_read_lock();
+    if (pud_none(pud) || pud_bad(pud))
+        goto out_ptl;
+    /* pmd_offset takes the live parent, including on folded page tables. */
     pmdp = pmd_offset(pudp, addr);
+    spin_unlock(ptl);
+
     ptl = pmd_lock(mm, pmdp);
     pmd = READ_ONCE(*pmdp);
     if (pmd_leaf(pmd)) {
         ret = mem_mapping_leaf(req, vma, __pte(pmd_val(pmd)),
                 ((uint64_t)pmd_pfn(pmd) << PAGE_SHIFT) +
                     (addr & ~PMD_MASK), PMD_SIZE);
-        spin_unlock(ptl);
-        rcu_read_unlock();
-        return ret;
+        goto out_ptl;
     }
-    ret = pmd_none(pmd) || pmd_bad(pmd);
+    if (pmd_none(pmd) || pmd_bad(pmd))
+        goto out_ptl;
     spin_unlock(ptl);
-    if (ret) {
-        rcu_read_unlock();
-        return -ENODATA;
-    }
 
+    /* On arm64 the PTE table is lowmem. RCU protects a detached table
+     * while we take its lock and revalidate the PMD, matching the
+     * pte_offset_map_lock protocol without an unexported helper. */
     ptep = pte_offset_kernel(&pmd, addr);
     ptl = pte_lockptr(mm, &pmd);
     spin_lock(ptl);
@@ -1558,7 +1556,9 @@ static int mem_mapping_locked(struct mm_struct *mm, unsigned long addr,
     /* Each member of an arm64 contiguous group carries its own PFN. Using
      * that member avoids incorrectly treating a 16/64K native page or a
      * CONT_PTE/CONT_PMD group as a single emulator (4K) page. */
+out_ptl:
     spin_unlock(ptl);
+out_rcu:
     rcu_read_unlock();
     return ret;
 }
@@ -1612,7 +1612,8 @@ int mem_query_access_mm(struct mm_struct *mm, unsigned long addr,
         if (vma->vm_flags & VM_READ) req->out_permissions |= MEM_MAPPING_F_READ;
         if (vma->vm_flags & VM_WRITE) req->out_permissions |= MEM_MAPPING_F_WRITE;
         if (vma->vm_flags & VM_EXEC) req->out_permissions |= MEM_MAPPING_F_EXEC;
-        if (vma->vm_flags & VM_MAYSHARE) req->out_permissions |= MEM_MAPPING_F_SHARED;
+        if (vma->vm_flags & (VM_SHARED | VM_MAYSHARE))
+            req->out_permissions |= MEM_MAPPING_F_SHARED;
         ret = mem_mapping_locked(mm, addr, &physical);
         if (!ret) req->out_state = MEM_ACCESS_RESIDENT;
         else if (ret == -ENODATA) req->out_state = MEM_ACCESS_NONRESIDENT;

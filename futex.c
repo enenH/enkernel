@@ -398,7 +398,7 @@ long dfm_capabilities(void __user *arg)
     if (req.abi_version != DFM_CAPABILITIES_ABI_VERSION ||
         req.reserved[0] || req.reserved[1]) return -EINVAL;
     req.out_abi_version = DFM_CAPABILITIES_ABI_VERSION;
-    req.out_features = DFM_CAP_REQUIRED;
+    req.out_features = DFM_CAP_REQUIRED | DFM_CAP_FILE_OBSERVER;
     if (dfm_sf_avc_ready())
         req.out_features |= DFM_CAP_SF_AVC_BYPASS;
     return copy_to_user(arg, &req, sizeof(req)) ? -EFAULT : 0;
