@@ -221,12 +221,12 @@ static void persistent_rules(bool saved_only)
     rule.x[1]=1;assert(dfm_pte_rules(state.owner,&req)==-EINVAL);rule.x[1]=0;
     rule.q[1][1]=1;assert(dfm_pte_rules(state.owner,&req)==-EINVAL);rule.q[1][1]=0;
     rule.address+=4;assert(dfm_pte_rules(state.owner,&req)==-ENOENT);rule.address-=4;
-    rule.flags|=4;assert(dfm_pte_rules(state.owner,&req)==-EINVAL);rule.flags&=~4U;
+    rule.flags|=8;assert(dfm_pte_rules(state.owner,&req)==-EINVAL);rule.flags&=~8U;
     flush_user_fpsimd=NULL;assert(dfm_pte_rules(state.owner,&req)==-EOPNOTSUPP);flush_user_fpsimd=flush_fp_mock;
     struct dfm_pte_rule duplicate[2]={rule,rule};req.rules=(uintptr_t)duplicate;req.count=2;
     assert(dfm_pte_rules(state.owner,&req)==-EEXIST);req.rules=(uintptr_t)&rule;req.count=1;
     assert(dfm_pte_rules(state.owner,&req)==0 && state.rules_active && syncs==1);
-    rule.flags|=4;assert(dfm_pte_rules(state.owner,&req)==-EINVAL);rule.flags&=~4U;
+    rule.flags|=8;assert(dfm_pte_rules(state.owner,&req)==-EINVAL);rule.flags&=~8U;
     assert(state.rules[0].x[0]==123 && state.rules_active && syncs==1);
     const struct user_fpsimd_state before=live_fp;
     for(unsigned n=0;n<200;++n) {
@@ -268,6 +268,39 @@ static void persistent_rules(bool saved_only)
     state.active=false;assert(dfm_pte_rules(state.owner,&req)==-ESRCH);
     session=NULL;assert(dfm_pte_rules(&outsider,&req)==-ENOENT);
     puts("PTE persistent register rules passed: 200 autonomous masked writes, pre-write records, ownership/generation, replace/remove and all-or-none failure");
+}
+static void predicate_rules(bool saved_only)
+{
+    struct dfm_pte_rule rule = { .address=PAGE_SIZE, .q_mask=1U<<3,
+        .flags=DFM_PTE_RULE_MATCH_X0, .x={0x12340000} };
+    struct dfm_pte_rules_req req = { .abi_version=DFM_PTE_RULES_ABI_VERSION,
+        .generation=1, .rules=(uintptr_t)&rule, .count=1 };
+    reset(); update_saved_only=saved_only;
+    rule.q[3][0]=0x3f800000;
+    rule.x_mask=1;assert(dfm_pte_rules(state.owner,&req)==-EINVAL);rule.x_mask=0;
+    rule.x[0]=0;assert(dfm_pte_rules(state.owner,&req)==-EINVAL);rule.x[0]=0x12340000;
+    rule.q_mask=0;assert(dfm_pte_rules(state.owner,&req)==-EINVAL);rule.q_mask=1U<<3;
+    assert(dfm_pte_rules(state.owner,&req)==0);
+    const struct user_fpsimd_state before=live_fp;
+    for(unsigned n=0;n<40;++n) {
+        const bool matches=(n&1)==0;
+        live_fp=before;regs.regs[0]=rule.x[0]+!matches;
+        assert(handle_fault(regs.pc,syndrome,&regs));el0_restore_mock();
+        const struct dfm_pte_record *r=&state.snapshot.records[n%64];
+        assert(r->patch_status==(matches?DFM_PTE_PATCH_APPLIED:0));
+        assert(regs.regs[0]==rule.x[0]+!matches);
+        assert(!memcmp(r->q,before.vregs,sizeof(r->q)));
+        if(matches)assert(!memcmp(&live_fp.vregs[3],rule.q[3],16));
+        else assert(!memcmp(&live_fp,&before,sizeof(before)));
+        cancel_current(&regs);
+    }
+    assert(update_calls==20 && flush_calls==20);
+    // A GPR predicate must not require the optional FPSIMD backend.
+    rule.q_mask=0;rule.q[3][0]=0;rule.x_mask=2;rule.x[1]=123;
+    preserve_user_fpsimd=NULL;assert(dfm_pte_rules(state.owner,&req)==0);
+    regs.regs[0]=rule.x[0];assert(handle_fault(regs.pc,syndrome,&regs));
+    assert(regs.regs[1]==123 && regs.regs[0]==rule.x[0]);cancel_current(&regs);
+    puts("PTE X0 predicate passed: matches write, other objects unchanged, masked vectors and no-FP GPR rules");
 }
 int main(void)
 {
@@ -419,6 +452,8 @@ int main(void)
     assert(!task.step && !task.refs && state.page[0].armed);
     persistent_rules(false);
     persistent_rules(true);
+    predicate_rules(false);
+    predicate_rules(true);
     puts("PTE production fault/step/notifier and synchronized Q0-Q31/FPCR/FPSR model passed");
     return 0;
 }

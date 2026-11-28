@@ -431,6 +431,7 @@ static bool handle_fault(unsigned long far, unsigned long esr,
     if (have_rule) {
         if (fp_generation != s->snapshot.generation || !s->rules_active ||
             rules_revision != s->rules_revision) patch_status = -ESTALE;
+        else if (!dfm_pte_rule_matches(&rule, regs->regs[0])) patch_status = 0;
         else if (dfm_pte_rule_uses_fp(&rule) && fp_status) patch_status = fp_status;
         else if (dfm_pte_rule_uses_fp(&rule) && !fpsimd_write_ready()) patch_status = -EOPNOTSUPP;
         else patch_status = DFM_PTE_PATCH_APPLIED;
@@ -769,7 +770,7 @@ long dfm_pte_info(void __user *arg)
     backend_error = resolve_backend();
     req.flags = DFM_PTE_INFO_STEP_WINDOW | (!backend_error ? DFM_PTE_INFO_AVAILABLE : 0);
     if (preserve_user_fpsimd && system_supports_fpsimd()) req.flags |= DFM_PTE_INFO_FPSIMD;
-    if (!backend_error) req.flags |= DFM_PTE_INFO_WRITE_GPR;
+    if (!backend_error) req.flags |= DFM_PTE_INFO_WRITE_GPR | DFM_PTE_INFO_MATCH_X0;
     if (fpsimd_write_ready()) req.flags |= DFM_PTE_INFO_WRITE_FPSIMD;
     req.backend_errno = backend_error;
     mutex_unlock(&control_lock);

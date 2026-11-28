@@ -92,6 +92,16 @@ Q masks select Q0-Q31 (whole 128-bit lanes). RULE_FPCR/RULE_FPSR select the two
 32-bit control/status values. PC, SP, PSTATE, arbitrary memory, callbacks and
 user bytecode are not writable through this API. Bits outside the masks, unused
 values, duplicate PCs, unknown flags and non-session addresses are rejected.
+
+INFO_MATCH_X0 advertises an optional exact input-X0 predicate without changing
+the ABI layout. Set RULE_MATCH_X0, put the nonzero required input in x[0], and
+leave x_mask bit 0 clear. X0 cannot also be replaced by that rule. Other selected
+registers are replaced only on matching hits; mismatches keep every register
+unchanged and report patch_status=0. This compares a register value, not object
+lifetime or ownership: the controller must invalidate the rule when its object
+changes, is freed, or the target context expires. A predicate alone with no
+replacement is rejected. Old modules reject this new flag instead of treating
+the predicate value as a replacement.
 The ioctl requires CAP_SYS_PTRACE in init_user_ns, the same file description
 as SET, and the exact snapshot generation. A fresh process/PID reuse cannot
 reuse old rules. A failed validation leaves the old configuration unchanged.

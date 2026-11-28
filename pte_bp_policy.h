@@ -38,7 +38,11 @@ static inline int dfm_pte_instruction_safe(uint32_t insn)
 }
 static inline int dfm_pte_rule_uses_fp(const struct dfm_pte_rule *r)
 {
-    return r->q_mask || r->flags;
+    return r->q_mask || (r->flags & (DFM_PTE_RULE_FPCR | DFM_PTE_RULE_FPSR));
+}
+static inline int dfm_pte_rule_matches(const struct dfm_pte_rule *r, uint64_t x0)
+{
+    return !(r->flags & DFM_PTE_RULE_MATCH_X0) || r->x[0] == x0;
 }
 static inline int dfm_pte_validate_rules(const struct dfm_pte_rules_req *req,
                                         const struct dfm_pte_rule *rules,
@@ -53,14 +57,17 @@ static inline int dfm_pte_validate_rules(const struct dfm_pte_rules_req *req,
         const struct dfm_pte_rule *r = &rules[i];
         if (!r->address || (r->address & 3) || r->address >= limit || limit-r->address < 4 ||
             (r->x_mask & (1U << 31)) || r->reserved ||
-            (r->flags & ~(DFM_PTE_RULE_FPCR | DFM_PTE_RULE_FPSR)) ||
-            !(r->x_mask || r->q_mask || r->flags)) return -EINVAL;
+            (r->flags & ~(DFM_PTE_RULE_FPCR | DFM_PTE_RULE_FPSR | DFM_PTE_RULE_MATCH_X0)) ||
+            !(r->x_mask || r->q_mask || (r->flags & (DFM_PTE_RULE_FPCR | DFM_PTE_RULE_FPSR)))) return -EINVAL;
+        if ((r->flags & DFM_PTE_RULE_MATCH_X0) &&
+            ((r->x_mask & 1U) || !r->x[0])) return -EINVAL;
         for (j = 0; j < i; ++j)
             if (rules[j].address == r->address) return -EEXIST;
         for (j = 0; j < count; ++j) if (points[j] == r->address) break;
         if (j == count) return -ENOENT;
         for (j = 0; j < 31; ++j)
-            if (!(r->x_mask & (1U << j)) && r->x[j]) return -EINVAL;
+            if (!(r->x_mask & (1U << j)) && r->x[j] &&
+                !(j == 0 && (r->flags & DFM_PTE_RULE_MATCH_X0))) return -EINVAL;
         for (j = 0; j < 32; ++j)
             if (!(r->q_mask & (1U << j)) && (r->q[j][0] || r->q[j][1])) return -EINVAL;
         if (!(r->flags & DFM_PTE_RULE_FPCR) && r->fpcr) return -EINVAL;

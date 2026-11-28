@@ -107,9 +107,11 @@ struct dfm_capabilities_req {
 #define DFM_PTE_INFO_FPSIMD (1U << 2)
 #define DFM_PTE_INFO_WRITE_GPR (1U << 3)
 #define DFM_PTE_INFO_WRITE_FPSIMD (1U << 4)
+#define DFM_PTE_INFO_MATCH_X0 (1U << 5)
 #define DFM_PTE_RULES_ABI_VERSION 1U
 #define DFM_PTE_RULE_FPCR (1U << 0)
 #define DFM_PTE_RULE_FPSR (1U << 1)
+#define DFM_PTE_RULE_MATCH_X0 (1U << 2)
 #define DFM_PTE_PATCH_APPLIED 1
 #define DFM_PTE_ACTIVE (1U << 0)
 #define DFM_PTE_INVALIDATED (1U << 1)
@@ -165,7 +167,11 @@ struct dfm_pte_read_req {
  * An in-flight write from the prior configuration is drained before RULES or
  * CLEAR returns. Q/FP writes require the write-FPSIMD backend at configuration
  * time and a successful synchronized capture on each hit; otherwise the whole
- * rule is skipped, including its X writes. Records describe pre-write state. */
+ * rule is skipped, including its X writes. Records describe pre-write state.
+ * MATCH_X0 uses x[0] as an exact input predicate rather than a replacement.
+ * It requires x_mask bit 0 clear and a nonzero x[0]. A mismatch leaves every
+ * register unchanged and records patch_status=0. Old modules reject this flag;
+ * query INFO_MATCH_X0 before use. The ABI layout/version is unchanged. */
 struct dfm_pte_rule {
     uint64_t address;
     uint32_t x_mask, q_mask, flags, reserved;

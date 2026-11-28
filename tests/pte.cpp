@@ -20,7 +20,9 @@ static VectorImage vector_image(unsigned batch, uint64_t value) {
         out.q[n][1] = 0xfedcba9876543210ULL ^ (uint64_t(batch) << 32) ^ n;
     }
     out.fpcr = batch & 1 ? 0x00400000 : 0x00800000;
-    out.fpsr = 1U << batch;
+    // FPSR cumulative exception flags occupy bits 0..4; bit 5 is RES0.
+    // The post-CLEAR sixth batch must not compare a reserved bit as writable.
+    out.fpsr = 1U << (batch % 5);
     return out;
 }
 static dfm_pte_rule write_rule(uint64_t address, unsigned batch) {
