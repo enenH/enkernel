@@ -400,6 +400,6 @@ long dfm_capabilities(void __user *arg)
     req.out_abi_version = DFM_CAPABILITIES_ABI_VERSION;
     req.out_features = DFM_CAP_REQUIRED | DFM_CAP_FILE_OBSERVER;
     if (dfm_sf_avc_ready())
-        req.out_features |= DFM_CAP_SF_AVC_BYPASS;
+        req.out_features |= DFM_CAP_SF_AVC_BYPASS | DFM_CAP_SF_NETD_SOCKET;
     return copy_to_user(arg, &req, sizeof(req)) ? -EFAULT : 0;
 }

@@ -20,14 +20,27 @@ The module registers an `avc_denied` return probe for the exact source context
 `u:r:surfaceflinger:s0`. It changes that subject's `-EACCES` results to success
 for all targets, classes and requested permissions handled by `avc_denied`.
 The source SID is resolved and round-trip checked against the loaded policy at
-initialization; process names, current-task credentials and target SIDs do not
-grant access. SELinux enforcing state, policy, AVC decisions/cache and audit
+initialization; process names, current-task credentials or target SIDs alone do
+not grant access. SELinux enforcing state, policy, AVC decisions/cache and audit
 hooks are not changed. DAC and checks outside `avc_denied` still apply.
 
+The same probe also permits the exact `u:r:netd:s0` source ->
+`u:r:surfaceflinger:s0` target pair for every AVC class and requested permission.
+Android's fwmarkd must receive the caller's socket through SCM_RIGHTS, inspect
+its domain/mark, and set its network mark before libc connects it. An
+SF-source-only grant does not cover those reverse accesses. Both exact contexts
+are resolved and round-trip checked before registering the probe. The reverse
+branch matches only those two SIDs; other sources or targets are not admitted
+by it. It does not change the `netdomain` attribute or replace errors other than
+`-EACCES`. This restores the network handoff previously supplied by that
+attribute in the removed policy package, with the explicitly broader permission
+scope for the netd -> SF pair.
+
 This replaces the separate root-manager policy package. The read-only capability
-handshake advertises `DFM_CAP_SF_AVC_BYPASS` only while the probe is registered.
-The SF injector requires this bit and asks for a reboot if an already loaded
-driver lacks it; core-only clients do not require the bit. Userspace downloads
+handshake advertises `DFM_CAP_SF_AVC_BYPASS` and `DFM_CAP_SF_NETD_SOCKET` only while
+the probe is registered with both contexts verified. SF injectors must require
+both bits so an older source-only driver cannot pass the network capability
+check. Core-only clients do not require either bit. Userspace downloads
 kernel modules from this repository's latest release, so deploy/release the
 updated module alongside the updated injector.
 
